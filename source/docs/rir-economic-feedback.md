@@ -1,0 +1,15 @@
+# RIR-driven forecasting and economic health
+
+The standalone Exchanger Integrity module is removed; inspection evidence remains available.
+
+Every MEDFI stage supports an assessed prospective consequence for F1 or F2: manual severity, an earlier matching mode/category/service lifecycle mean, or an earlier portfolio lifecycle average multiplied by uncertainty. Estimates exclude the current lifecycle and later events. Missing historical evidence remains unquantified. Price normalization uses event-year nominal costs and the selected inflation assumption.
+
+A consequence is not a probability. Users supply likelihood, horizon, rationale, and confirmation that exposure is incremental to baseline and other assessments. The model distributes unconditional probability uniformly over the horizon beginning at the RIR date. Expired exposure stops contributing; the latest linked record supersedes its predecessor. This is a transparent scenario layer, not a statistically fitted precursor hazard model. Intervention effectiveness applies to both historical expected loss and assessed prospective loss.
+
+Working mode incorporates saved provisional RIRs immediately. Reviewed mode restricts evidence to Approved/Closed records. Observed corrective F1 functional failures calibrate recurrence, with linked lifecycles counted once. Assessed findings add expected events and monetary exposure without pretending they are observed failures or changing fitted Crow–AMSAA parameters. MTBF remains dependent on reviewed failures and verified operating exposure. Potential monetary exposure does not create a downtime-duration estimate.
+
+The RIR Impact Monitor compares identical assumptions and cutoff with/without one RIR. This is contribution analysis, not a stored historical revision snapshot. NPV, IRR, first payback and PI curves are available by candidate replacement year. Undefined metrics remain gaps. NPV uses a common origin; delayed replacement IRR starts at intervention.
+
+Lifecycle scan offers two distinct analyses. Hindsight uses recorded actual losses, modeled avoidance, replacement/renewal cost, maintenance and residual value over a common calendar horizon. It reports modeled savings, not proven recoverable savings; missing historical coverage is disclosed. Payback is the first recovery and does not guarantee that later renewal outlays remain recovered. Decision-time mode excludes later incident dates and backcasts current financial assumptions. Because record-availability timestamps and contemporaneous financial assumptions are unavailable, it is not a verified reconstruction of what decision makers knew. Its rolling-horizon NPVs have different valuation origins and are not ranked against one another.
+
+Validation covers domain cash-flow reconciliation, MTBF/exposure, lifecycle deduplication, RIR before/after economic metrics, provisional versus reviewed evidence, probability integration and expiry, historical severity fallback, supersession, invalid assessment rejection, and an independent historical cash-flow reference case.

@@ -1,0 +1,3 @@
+import {db} from './auth';
+import {seed} from './domain';
+export async function ownerData(owner:string){const data=seed();const rows=await db().prepare('SELECT kind,body FROM records WHERE owner=?').bind(owner).all<{kind:string,body:string}>();const extras:Record<string,any[]>={assets:[],incidents:[],actions:[],scenarios:[],settings:[]};for(const r of rows.results){if(extras[r.kind])extras[r.kind].push(JSON.parse(r.body));}for(const k of ['assets','incidents','actions'] as const){const map=new Map(data[k].map(x=>[x.id,x]));extras[k].forEach(x=>map.set(x.id,x));(data as any)[k]=[...map.values()];}return {...data,scenarios:extras.scenarios,settings:extras.settings};}

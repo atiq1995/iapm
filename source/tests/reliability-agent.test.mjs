@@ -1,0 +1,35 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import ts from 'typescript';
+import assert from 'node:assert/strict';
+const dir=path.resolve('.sites-runtime/agent-tests');await fs.mkdir(dir,{recursive:true});
+await fs.writeFile(`${dir}/runtime.mjs`, `import {DatabaseSync} from 'node:sqlite';
+export const sql=new DatabaseSync(':memory:');sql.exec('CREATE TABLE sessions(id TEXT,owner TEXT,expires INTEGER);CREATE TABLE records(id TEXT,owner TEXT,kind TEXT,body TEXT,updated INTEGER)');
+export let user=null;export let cookie='';export function context(u,c=''){user=u;cookie=c;}export async function getChatGPTUser(){return user;}export async function cookies(){return {get:()=>cookie?{value:cookie}:undefined};}
+export const env={DB:{prepare(q){let a=[];const s=sql.prepare(q);return {bind(...v){a=v;return this;},async first(){return s.get(...a)||null},async all(){return {results:s.all(...a)}}}}}};
+`);
+const files=(await fs.readdir('lib')).filter(x=>x.endsWith('.ts')).map(x=>['lib/'+x,x.replace('.ts','')]);files.push(['app/api/reliability-agent/route.ts','agent-route']);
+for(const [src,name] of files){let s=await fs.readFile(src,'utf8');s=s.replace(/(['"])@\/lib\/([^'"]+)\1/g,"'./$2.mjs'").replace(/(['"])\.\/([^'".]+)\1/g,"'./$2.mjs'").replaceAll("'cloudflare:workers'","'./runtime.mjs'").replaceAll("'next/headers'","'./runtime.mjs'").replaceAll("'@/app/chatgpt-auth'","'./runtime.mjs'");await fs.writeFile(`${dir}/${name}.mjs`,ts.transpileModule(s,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText);}
+const {seed,defaultAssumptions,dcbf}=await import(`${dir}/domain.mjs`),{assetMTBF}=await import(`${dir}/mtbf.mjs`),{answerQuery,parseQuestion,emptyPlan}=await import(`${dir}/reliability-agent.mjs`),rt=await import(`${dir}/runtime.mjs`),api=await import(`${dir}/agent-route.mjs`),{digest}=await import(`${dir}/auth.mjs`);
+const data=seed(),p={...emptyPlan,intent:'loss',limit:20};
+assert.equal(parseQuestion('Show MTBF for R-101',data,emptyPlan).intent,'help');
+assert.equal(parseQuestion('Show potential loss',data,emptyPlan).intent,'help');
+assert.equal(parseQuestion('Show only F2 incidents',data,emptyPlan).intent,'help');
+assert.equal(parseQuestion('Which assets have the lowest MTBF?',data,emptyPlan).ascending,true);
+assert.equal(parseQuestion('Show latest RIRs for SC-E-101 in 2024',data,emptyPlan).assetId,'AST-1');
+assert.equal(parseQuestion('Compare actual loss by site',data,emptyPlan).intent,'sites');
+const ans=answerQuery(data,p),actual=data.incidents.filter(e=>e.impact==='F1'&&['Approved','Closed'].includes(e.status)&&+e.date.slice(0,4)>=2016&&+e.date.slice(0,4)<=2025);assert.equal(ans.sourceCount,actual.length);
+const mtbf=answerQuery(data,{...p,intent:'mtbf',assetId:'AST-1'});assert.ok(mtbf.rows[0].values[1].includes(Math.floor(assetMTBF(data.assets[0],data.incidents).hours).toLocaleString('en-US'))||mtbf.rows[0].values[1]===assetMTBF(data.assets[0],data.incidents).hours.toLocaleString('en-US',{maximumFractionDigits:2}));
+const economics=answerQuery(data,{...p,intent:'economics',assetId:'AST-1'},defaultAssumptions);assert.equal(economics.rows.length,dcbf(data,'AST-1',defaultAssumptions).timing.length);assert.ok(economics.answer.includes(String(dcbf(data,'AST-1',defaultAssumptions).best.year)));
+const request=(body,origin='https://example.test')=>new Request('https://example.test/api/reliability-agent',{method:'POST',headers:{origin,'Content-Type':'application/json'},body:typeof body==='string'?body:JSON.stringify(body)});
+assert.equal((await api.POST(request({question:'Show asset overview'}))).status,401);
+rt.sql.prepare('INSERT INTO sessions VALUES(?,?,?)').run(await digest('token'),'owner',Date.now()+100000);rt.context({userId:'owner'},'token');
+assert.equal((await api.POST(request({question:'Show asset overview'},'https://evil.test'))).status,403);
+assert.equal((await api.POST(request('{'))).status,400);
+assert.equal((await api.POST(request({question:'hello',context:{...p,assetId:'invalid'}}))).status,400);
+const extra={...data.assets[0],id:'PRIVATE',tag:'PRIVATE-E-1'};rt.sql.prepare('INSERT INTO records VALUES(?,?,?,?,?)').run('private','other','assets',JSON.stringify(extra),1);
+const response=await api.POST(request({question:'Show asset overview'}));assert.equal(response.status,200);const result=await response.json();assert.ok(result.answer.startsWith('128 assets'));assert.ok(!JSON.stringify(result).includes('PRIVATE-E-1'));
+rt.context({userId:'other'},'token');assert.equal((await api.GET()).status,401);
+rt.context({userId:'owner'},'token');rt.env.OPENAI_API_KEY='test-only';rt.env.OPENAI_MODEL='test-model';globalThis.fetch=async()=>Response.json({output:[{content:[{type:'output_text',text:'{"intent":"runSQL"}'}]}]});const fallback=await(await api.POST(request({question:'Show asset overview',useAI:true}))).json();assert.ok(fallback.notice.includes('unavailable'));assert.equal(fallback.mode,'Guided data query');
+rt.sql.prepare('UPDATE sessions SET expires=0').run();assert.equal((await api.GET()).status,401);
+console.log('Reliability assistant: 18 grounding, calculation, authentication, owner isolation and AI fallback assertions passed.');

@@ -1,0 +1,27 @@
+import assert from 'node:assert/strict';
+import {seed,dcbf,defaultAssumptions} from '../.sites-runtime/tests/domain.mjs';
+import {estimateRisk,newRisk} from '../.sites-runtime/tests/risk-feedback.mjs';
+import {lifecycleScan} from '../.sites-runtime/tests/lifecycle-scan.mjs';
+import {validateRecord} from '../.sites-runtime/tests/validation.mjs';
+const d=seed(),p={...defaultAssumptions,evidenceMode:'Working',evidenceThrough:'2026-09-28'};
+const base=dcbf(d,'AST-1',p);const e={...d.incidents[0],id:'finding',date:'2026-09-28T10:00',stage:'D',status:'Draft',impact:'F2',failureEvent:false,activity:'Preventive',loss:0,downtime:0,productDays:[0,0,0],quantity:[0,0,0],prospective:{...newRisk(),enabled:true,method:'Manual',manualLoss:10000000,probability:.6,horizonYears:2,incremental:true,rationale:'Additional inspection finding with explicit engineering likelihood'}};
+const data={...d,incidents:[...d.incidents,e]},updated=dcbf(data,'AST-1',p);
+assert.equal(updated.ev.rows.length,base.ev.rows.length);assert.equal(updated.ev.crow.beta,base.ev.crow.beta);
+assert.ok(Math.abs(updated.forecasts.reduce((v,r)=>v+r.riskEvents,0)-.6)<1e-8);
+assert.ok(Math.abs(updated.forecasts[0].potentialLoss-3000000*1.025)<1e-8);
+assert.ok(updated.scenarios[1].npv>base.scenarios[1].npv);
+assert.equal(updated.forecasts[3].riskEvents,0);
+assert.equal(dcbf(data,'AST-1',{...p,evidenceMode:'Reviewed'}).risks.length,0);
+assert.equal(validateRecord('incidents',e,d),null);
+assert.ok(validateRecord('incidents',{...e,prospective:{...e.prospective,probability:2}},d));
+assert.ok(validateRecord('incidents',{...e,prospective:{...e.prospective,incremental:false}},d));
+const resolved={...e,id:'resolved',stage:'F',date:'2026-09-28T11:00',parentId:e.id,prospective:{...e.prospective,resolved:true}};
+assert.equal(dcbf({...data,incidents:[...data.incidents,resolved]},'AST-1',p).risks.length,0);
+const h=estimateRisk({...e,mode:'No matching mode',prospective:{...e.prospective,method:'Historical',uncertainty:2}},d,2026,0);assert.ok(h.loss>0);assert.ok(h.basis.includes('portfolio'));
+const none=estimateRisk({...e,prospective:{...e.prospective,method:'Historical'}},{...d,incidents:[]},2026,0);assert.equal(none.loss,null);
+const scan=lifecycleScan(d,'AST-1',p,1982,2026);assert.equal(scan.rows.length,44);assert.equal(scan.best.npv,Math.max(...scan.rows.map(r=>r.npv)));assert.ok(scan.rows.every(r=>Number.isFinite(r.npv)));
+for(const s of updated.scenarios)assert.ok(Math.abs(updated.baselineLcc-s.lcc-s.npv)<1e-5);
+// Independent two-year counterfactual: capex100, 50% avoided loss on200, no maintenance, no residual.
+const simple={...d,assets:[{...d.assets[0],commissioned:2020}],incidents:[{...d.incidents[0],date:'2020-06-01',loss:200,maintenance:0,status:'Approved'}]};
+const sc=lifecycleScan(simple,'AST-1',{...p,year:2020,capex:100,disposal:0,salvage:0,maintenance:0,inflation:0,wacc:0,effectiveness:.5,designLife:2,terminal:0},2020,2022);assert.equal(sc.rows[0].npv,0);
+console.log('Risk feedback and lifecycle scan: manual/fallback severity, probability integration, draft response, reviewed exclusion, supersession, validation and independent cash-flow checks passed.');

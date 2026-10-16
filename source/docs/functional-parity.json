@@ -1,0 +1,242 @@
+[
+  {
+    "origin": "Source",
+    "feature": "Annual loss trajectory and board",
+    "reference": "annual render / board sorting",
+    "location": "Executive overview / Bad actors",
+    "status": "Implemented",
+    "evidence_or_limitation": "Approved-only aggregates; shared year filters"
+  },
+  {
+    "origin": "Source",
+    "feature": "Scatter X/Y and minimum-loss controls",
+    "reference": "scatter settings",
+    "location": "Bad actors",
+    "status": "Implemented",
+    "evidence_or_limitation": "Independent axes, asset drill-down, top-N and minimum actual loss"
+  },
+  {
+    "origin": "Source",
+    "feature": "16 site/category lists",
+    "reference": "generateBadActorListsCore; category minVdt",
+    "location": "Bad actors",
+    "status": "Partial",
+    "evidence_or_limitation": "4 \u00d7 4 groups; 1 / 0.5 / 0.25 / 0.25 day thresholds; active filters; CSV instead of source XLSX + Word bundle"
+  },
+  {
+    "origin": "Source",
+    "feature": "Actual/potential virtual downtime",
+    "reference": "secondary impact estimation; max product downtime",
+    "location": "Bad actors / Incidents",
+    "status": "Implemented with correction",
+    "evidence_or_limitation": "F1 owns actual loss; prior matching F1 evidence for F2; no future leakage"
+  },
+  {
+    "origin": "Source",
+    "feature": "Product intersection selection",
+    "reference": "Venn loss zones",
+    "location": "Bad actors",
+    "status": "Implemented",
+    "evidence_or_limitation": "Exact product-channel combinations via accessible buttons"
+  },
+  {
+    "origin": "Source",
+    "feature": "Global and advanced filtering",
+    "reference": "getFilters",
+    "location": "Application context bar",
+    "status": "Partial",
+    "evidence_or_limitation": "Site, unit, category, years, impact, nature, mode, activity, reference, search, exclusions; separate downtime/low-load plant dimensions not yet modelled"
+  },
+  {
+    "origin": "Source",
+    "feature": "Primary/secondary event evidence and pivots",
+    "reference": "drill-down workspace",
+    "location": "Incidents / Asset 360",
+    "status": "Partial",
+    "evidence_or_limitation": "Record-level evidence and export; arbitrary pivot dimensions not yet exposed"
+  },
+  {
+    "origin": "Source",
+    "feature": "Comparative analysis",
+    "reference": "comparison workspace",
+    "location": "Comparative analysis",
+    "status": "Partial",
+    "evidence_or_limitation": "Site/category comparisons and site top 20; radar and metric-distribution parity outstanding"
+  },
+  {
+    "origin": "Source",
+    "feature": "Replacement screening",
+    "reference": "future replacement workspace",
+    "location": "Replacement screening",
+    "status": "Implemented with limits",
+    "evidence_or_limitation": "Seven enable/disable triggers; horizon/count/limit; most numeric trigger defaults fixed"
+  },
+  {
+    "origin": "Source",
+    "feature": "Tube-bundle integrity",
+    "reference": "renderHXChronology",
+    "location": "Removed",
+    "status": "Removed by user request",
+    "evidence_or_limitation": "Standalone exchanger integrity module removed; underlying asset inspection evidence retained."
+  },
+  {
+    "origin": "Source",
+    "feature": "Weibull life analysis",
+    "reference": "wbFitWeibull; runWeibullAnalysis",
+    "location": "Reliability models",
+    "status": "Partial",
+    "evidence_or_limitation": "Manual life-distribution curves/B10/B50; original probability-plot fitting and maintenance interval outputs outstanding"
+  },
+  {
+    "origin": "Source",
+    "feature": "Model validation",
+    "reference": "_dcbfValFitCrowAmsaa; _dcbfValFitBayesian; _dcbfValFitLogLinear; _dcbfValFitWeibull; _dcbfValFitLognormal",
+    "location": "Reliability models",
+    "status": "Implemented with corrections",
+    "evidence_or_limitation": "Six families; same temporal holdout; log-linear MLE; censored renewal simulation; deterministic Bayesian quadrature with different declared priors; no interval claims"
+  },
+  {
+    "origin": "Source",
+    "feature": "DCBF A1/A2/B/C scenarios",
+    "reference": "DCBF calculation workspace",
+    "location": "DCBF workbench",
+    "status": "Implemented with corrections",
+    "evidence_or_limitation": "Common baseline/horizon; incremental NPV reconciles with baseline PV less scenario PV"
+  },
+  {
+    "origin": "Source",
+    "feature": "Replacement timing",
+    "reference": "DCBF timing calculations",
+    "location": "DCBF workbench",
+    "status": "Implemented with corrections",
+    "evidence_or_limitation": "Delayed capex; no pre-intervention benefits; consistent terminal value; payback from intervention"
+  },
+  {
+    "origin": "Source",
+    "feature": "Calibration and forecast controls",
+    "reference": "estimateCrowAmsaa; forecastFailuresCrowAmsaaAt",
+    "location": "DCBF workbench",
+    "status": "Implemented",
+    "evidence_or_limitation": "History window, Crow/HPP/manual, recurrence rate and exponent, horizon, economics inputs"
+  },
+  {
+    "origin": "Source",
+    "feature": "Maturity and elimination factors",
+    "reference": "DCBF scenario assumptions",
+    "location": "DCBF workbench",
+    "status": "Partial",
+    "evidence_or_limitation": "Scalar starting maturity, linear ramp and FEF; arbitrary user maturity tables outstanding"
+  },
+  {
+    "origin": "Source",
+    "feature": "Saved cases and exports",
+    "reference": "DCBF saved analyses",
+    "location": "DCBF workbench",
+    "status": "Implemented",
+    "evidence_or_limitation": "Server persistence; load and recalculate; per-scenario cash-flow CSV"
+  },
+  {
+    "origin": "Source",
+    "feature": "CAPEX allocation and mandatory overrides",
+    "reference": "DCBF fleet prioritization",
+    "location": "Capital portfolio",
+    "status": "Partial",
+    "evidence_or_limitation": "Weighted heuristic, mandatory-first allocation and explicit budget conflict; mandatory rationale persistence and detailed multi-year scheduling outstanding"
+  },
+  {
+    "origin": "Source",
+    "feature": "Lifecycle history, sensitivity and manual cases",
+    "reference": "lifecycle workspace",
+    "location": "Lifecycle cost / DCBF",
+    "status": "Partial",
+    "evidence_or_limitation": "Historical maintenance/production loss; forward cost assumptions and scenario CSV; sensitivity chart and cumulative history outstanding"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Real password and private access",
+    "reference": "Private access requirement",
+    "location": "Welcome / server API",
+    "status": "Implemented; hosted verification pending",
+    "evidence_or_limitation": "Owner platform identity plus PBKDF2 password; HttpOnly session; expiry/rate limit/logout tests"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "MEDFI MRT four-level framework",
+    "reference": "M Delta E / D / F / I",
+    "location": "Incidents & MEDFI",
+    "status": "Implemented",
+    "evidence_or_limitation": "Stage separate from F1/F2; approved leading evidence can spawn linked progression"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Asset register four categories",
+    "reference": "Register requirement",
+    "location": "Assets",
+    "status": "Partial",
+    "evidence_or_limitation": "Hierarchy, category constraints, self-service and export; bulk import outstanding"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "RIR lifecycle and audit",
+    "reference": "Draft to Closed",
+    "location": "Incidents",
+    "status": "Implemented",
+    "evidence_or_limitation": "Server-side transitions, immutable approval, duplicate and parent checks"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Recommendations and actions",
+    "reference": "Execution requirement",
+    "location": "Recommendations & actions",
+    "status": "Implemented",
+    "evidence_or_limitation": "Owner/due/horizon/category/status/evidence; completion verification"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Data refinery walkthrough",
+    "reference": "Four-phase illustrative workflow",
+    "location": "Data refinery",
+    "status": "Implemented",
+    "evidence_or_limitation": "Clearly illustrative; four provisional export schemas"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Executive presentation",
+    "reference": "Eight-stop five-minute journey",
+    "location": "Start Executive Demo",
+    "status": "Implemented",
+    "evidence_or_limitation": "Guided navigation through working screens"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Persistence, settings and reset",
+    "reference": "Data administration",
+    "location": "Settings & methodology",
+    "status": "Partial",
+    "evidence_or_limitation": "D1 records, scenarios and saved views; deterministic initial seed; reset/restore UI outstanding"
+  },
+  {
+    "origin": "Project brief",
+    "feature": "Configurable product/currency calculations",
+    "reference": "Product modelling requirement",
+    "location": "DCBF / incident evidence",
+    "status": "Partial",
+    "evidence_or_limitation": "USD and three fixed seed products; enterprise product configuration outstanding"
+  },
+  {
+    "origin": "Enhancement",
+    "feature": "Numerical and API regression evidence",
+    "reference": "tests/domain.test.mjs; tests/api.test.mjs",
+    "location": "Repository documentation",
+    "status": "Implemented",
+    "evidence_or_limitation": "23 deterministic checks; mocked identity and in-memory SQLite, not hosted browser tests"
+  },
+  {
+    "origin": "User request \u00b7 2026-09-13",
+    "feature": "Asset criticality assessment and ranking",
+    "reference": "Orange REM criticality-analysis chapter, printed pp. 3\u201318; PDF pp. 9\u201317",
+    "location": "Assets / Asset criticality; Asset 360; asset creation",
+    "status": "Implemented",
+    "evidence_or_limitation": "Eight guided 1\u20135 criteria; configurable weights/bands; separate severe-consequence override; draft/review/history; normalized legacy criticality input; ranked export; stale-revision protection. Defaults are MVP adaptations, not book-mandated criteria. Review is recorded in the owner workspace, not independent role approval."
+  }
+]

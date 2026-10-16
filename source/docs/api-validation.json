@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-16",
+  "passed": 16,
+  "scope": "Production route code with in-memory SQLite and email/password sessions; not hosted end-to-end",
+  "checks": [
+    "Anonymous API denied",
+    "Password setup, salted hash and secure session cookie",
+    "Incorrect password rejected",
+    "Authenticated seed read",
+    "Asset persists across independent API reads",
+    "Five-state RIR lifecycle, audit history and storage",
+    "Approved evidence is immutable",
+    "ACA draft persists without changing reviewed criticality",
+    "ACA reviewed score and normalized portfolio input persisted",
+    "Stale ACA revision rejected",
+    "Incomplete ACA cannot be marked reviewed",
+    "Ordinary asset update cannot inject an ACA score",
+    "Concurrent ACA saves preserve the winning revision",
+    "Expired session denied",
+    "Logout invalidates server-side session",
+    "Repeated failures rate-limited"
+  ]
+}

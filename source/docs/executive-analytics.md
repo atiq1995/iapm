@@ -1,0 +1,15 @@
+# Executive analytics upgrade
+
+The application now uses module tabs, an icon ribbon, contextual module navigation and a site/category hierarchy. Existing workflows remain reachable, including the reliability assistant, simulation booth, RIR capture and economic workbench.
+
+The synthetic dataset contains 128 assets and 4,776 incidents spanning 1990 through September 2026. Every year contains all four sites and categories. Synthetic commissioning and operating exposure were extended consistently; record IDs remain owner-overlay compatible. This replaces the demonstration baseline, not persisted owner records. Forecasts will change with this expanded history.
+
+Executive overview includes site/category bubble comparisons with independent numeric X, Y and size selectors, category statistics and a 32-type visualization studio. Stacked-column defaults are year buckets / actual loss / category legend / site split. Year intervals are anchored at the globally selected start year and can be 1, 5, or any integer 1–37. Partial final intervals are labeled accurately. Legend and split fields are categorical dimensions; measures are numeric, with units in controls. Single-series plots, distributions, hierarchy views and matrix views expose only relevant controls where applicable.
+
+Eight additive measures: downtime events, virtual downtime, production loss (synthetic tonnes), actual business loss, potential F2 exposure, maintenance cost, repair effort and record count. Approved/closed records are deduplicated by ID. Actual and potential loss stay separate. Unknown historical exposure estimates are not silently represented as known zero; coverage is shown. A downtime event is an approved F1 record with positive downtime, not a deduplicated failure lifecycle. MTBF remains in the verified-exposure module and is not summed like an additive metric.
+
+Potential exposure in this historical dashboard is the existing matching-history F2 consequence estimate. It is not a current risk register, probability-weighted forward cash flow, or DCBF forecast. Reviewed ACA matrices use latest consequence and propensity ratings for assets appearing in the filtered evidence, not historical rating snapshots.
+
+The chart catalog includes 32 useful BI-style types/variants, not full feature parity with Power BI or Tableau. Non-time categorical charts are limited to the leading 16 groups; Pareto and tables include all groups. Heat maps display the first 16 labels on each dimension. The ranked funnel is a contribution ranking, not conversion. Histogram and box plots use record-level measures; sunburst uses group-to-split hierarchy; waterfall shows cumulative positive contributions. Grouped-total CSV exports do not encode non-additive display transformations such as histogram bins.
+
+Validation: metric reconciliation across groupings and interval sizes, deduplication/approval, historical coverage, F1/F2 separation, 32 server-render paths and empty states, TypeScript, existing reliability/financial/MTBF/assistant checks. Browser visual QA was unavailable because the required control-browser skill was not available in this session.

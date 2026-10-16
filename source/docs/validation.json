@@ -1,0 +1,22 @@
+{
+  "date": "2026-09-13",
+  "passed": 16,
+  "checks": [
+    "Deterministic seed, four categories and no pre-commissioning events",
+    "Production totals and maximum product downtime reconcile",
+    "Deduplication and approved-only actual aggregates",
+    "Filters reconcile site/category/year/empty selection",
+    "Potential estimates do not use future evidence",
+    "Independent NPV, IRR and payback reference cases",
+    "DCBF baseline and alternatives reconcile on common horizon",
+    "Zero WACC and no failure evidence are finite",
+    "RIR lifecycle enforced on server validation",
+    "Invalid category, missing asset and completed action evidence rejected",
+    "All six model families return finite training-only predictions",
+    "CSV formula cells escaped",
+    "ACA equal weights, thresholds and missing ratings",
+    "ACA weighting and severe-consequence override",
+    "ACA drafts preserve reviewed ranking and history",
+    "ACA incomplete review and invalid economics rejected"
+  ]
+}
