@@ -12,7 +12,8 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "test:domain": "node tests/domain.test.mjs",
-    "test:api": "node tests/api.test.mjs"
+    "test:api": "node tests/api.test.mjs",
+    "test:assistant": "node tests/assistant.test.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
