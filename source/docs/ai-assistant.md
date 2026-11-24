@@ -36,6 +36,9 @@ Answer → citation check (every RIR/AST/ACT ID must exist) → saved conversati
 * **ID correction.** Every "TAG [AST-n]" pair in an answer is checked against the register and corrected if the model mismatched them.
 * **Figure check.** Every number above 100 in an answer must match a number in the data retrieved for it; otherwise the answer shows an amber warning naming the figure.
 * **Trend charts.** Questions with "trend", "plot", "chart", "per year", "over time" and similar get a chart (bars for event counts, a line for money and days) with an **Open in Executive overview** button that applies the same filters. Charts also work with no model attached.
+* **Executive answers.** Rankings and comparisons (bad actors, sites, categories, MTBF) show a bar chart plus a table; trends show a chart with an optional data table. The **headline is calculated** from the data (e.g. "Safa Coast leads actual loss with $271.1M, about a third (32.6%) of the $832.2M total"), replacing the model's own; when no item exceeds 50% of the total, words such as "dominates", "majority" and "the bulk of" are toned down. Money is shown as $271.1M and percentages with one decimal.
+* **Follow-ups.** Short presentation requests ("Create a tabulated summary", "chart it") re-use the previous question's data.
+* **Reasoning effort.** With `gpt-5-nano`, `AI_REASONING_EFFORT=low` gives noticeably more accurate commentary than `minimal` (about 5–8 s per answer instead of 3–5 s; still a fraction of a cent).
 * **Rate limit.** `AI_RATE_PER_MINUTE` (default 15) questions per minute per account, per server instance.
 * **Numbers come from the iAPM engine**, never from the model. The model only chooses tools and writes the explanation.
 * **Read-only by construction.** Tools receive a frozen in-memory copy of the data and no database handle. Unknown tool names (for example `delete_asset`) are rejected. The route writes only the owner's conversation history (`assistant_chat`) and the usage ledger (`ai_usage`).
@@ -104,7 +107,7 @@ Check each provider's current documentation for exact model IDs before going liv
 node tests/assistant.test.mjs
 ```
 
-27 checks, including trend numbers matching the Executive overview engine, the figure check, charts without a model, and the rate limit. Also covered: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
+34 checks, including calculated headlines, the "create a table" fix, site comparisons matching Bad actors, follow-ups, trend numbers matching the Executive overview engine, the figure check, charts without a model, and the rate limit. Also covered: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
 
 ## Production notes
 

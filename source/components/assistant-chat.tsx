@@ -4,13 +4,13 @@ import {Bot,Send,Plus,MessageSquare,FileText,ArrowUpRight,Lock,Wrench,CircleChec
 import {Button} from '@/components/ui/button';
 import {AssistantMarkdown} from './assistant-markdown';
 import {AssistantChart} from './assistant-chart';
-import type {TrendChart} from '@/lib/assistant/tools';
+import type {AssistantVisual} from '@/lib/assistant/tools';
 import type {Filters} from '@/lib/domain';
 import type {Dataset,Assumptions,Incident} from '@/lib/domain';
 
 export type AssistantStatus={name:string,connected:boolean,modelLabel:string|null,endpointHost:string|null,readOnly:true,engine:'model'|'guided',message:string};
 type Source={id:string,label:string,assetId:string,incidentId?:string};
-type Message={role:'user'|'assistant',content:string,at?:string,sources?:Source[],steps?:{tool:string,summary:string,ok:boolean}[],warnings?:string[],engine?:'model'|'guided',model?:string,notice?:string,charts?:TrendChart[]};
+type Message={role:'user'|'assistant',content:string,at?:string,sources?:Source[],steps?:{tool:string,summary:string,ok:boolean}[],warnings?:string[],engine?:'model'|'guided',model?:string,notice?:string,charts?:AssistantVisual[]};
 export type Conversation={id:string,title:string,updatedAt:string,messages:Message[]};
 
 const PROMPTS=['Which assets are driving our actual production losses?','Give me a full profile of SC-E-101.','Why does SC-E-101 keep failing? Show the recorded causes.','Which assets have the lowest MTBF?','Compare actual loss across sites from 2016 to 2025.','What is the replacement business case for SC-E-101?'];
@@ -63,7 +63,7 @@ export function AssistantChat(props:{data:Dataset,assumptions:Assumptions,status
     {current?.messages.map((m,i)=><article className={'ai-message '+m.role} key={i}>
      <div className="asst-head">{m.role==='user'?<b>You</b>:<><b>{name}</b><span className={'badge '+(m.engine==='model'?'green':'')}>{m.engine==='model'?'AI model'+(m.model?' · '+m.model:''):'Guided engine'}</span></>}{m.at&&<span>{new Date(m.at).toLocaleString()}</span>}</div>
      {m.role==='user'?<div className="ai-answer-text">{m.content}</div>:<AssistantMarkdown text={m.content} isKnown={isKnown} onCite={id=>openRecord(id,m.sources?.find(s=>s.id===id)?.assetId)}/>}
-     {m.charts?.map((c,j)=><AssistantChart key={j} chart={c} onOpenOverview={props.openOverview?()=>props.openOverview!({site:c.filters.site||'All sites',category:c.filters.category||'All categories',asset:c.filters.asset||'All',mode:c.filters.mode||'All',from:c.filters.from,to:c.filters.to}):undefined} onOpenAsset={c.filters.asset?()=>props.openAsset(c.filters.asset):undefined}/>)}
+     {m.charts?.map((c,j)=><AssistantChart key={j} chart={c} onOpenOverview={props.openOverview?()=>props.openOverview!({site:c.filters.site||'All sites',category:c.filters.category||'All categories',asset:c.filters.asset||'All',mode:c.filters.mode||'All',from:c.filters.from,to:c.filters.to}):undefined} onOpenAsset={props.openAsset}/>)}
      {m.notice&&<p className="callout amber asst-note">{m.notice}</p>}
      {!!m.warnings?.length&&<div className="callout amber asst-note"><TriangleAlert size={14}/> {m.warnings.join(' ')}</div>}
      {!!m.steps?.length&&<details><summary><Wrench size={14}/> How {name} answered ({m.steps.length} read-only {m.steps.length===1?'query':'queries'})</summary><ul className="asst-steps">{m.steps.map((s,j)=><li key={j}>{s.ok?<CircleCheck size={13} className="asst-ok"/>:<CircleX size={13} className="asst-bad"/>}<code>{s.tool}</code><span>{s.summary}</span></li>)}</ul></details>}

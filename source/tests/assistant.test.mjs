@@ -50,6 +50,8 @@ const { ownerData } = await load('owner-data.mjs');
 const { defaultAssumptions } = await load('domain.mjs');
 
 const passed = [];
+// Calculated headline for the all-asset actual-loss ranking (seed data, 1990–2026).
+const TOP_LOSS_HEADLINE = '**SC-E-101 leads actual loss with $253.6M, 8.2% of the $3.1B total across 128 assets.**';
 const check = (name, fn) => Promise.resolve(fn()).then(() => passed.push(name));
 const ORIGIN = 'https://test.invalid';
 const post = (body, origin = ORIGIN) => route.POST(new Request(ORIGIN + '/api/assistant', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: typeof body === 'string' ? body : JSON.stringify(body) }));
@@ -129,7 +131,9 @@ await check('Guided engine answers with cited records and no AI usage', async ()
   assert.equal(answer.engine, 'guided');
   assert.ok(answer.sources.length > 0);
   assert.match(answer.notice, /guided query engine/);
-  assert.match(answer.content, /\| Asset \/ group \|/);
+  assert.match(answer.content, /^\*\*SC-E-101 leads actual loss with \$253\.6M \(8\.\d% of \$3\.1B\)\.\*\*/);
+  assert.equal(answer.charts[0].kind, 'ranking');
+  assert.equal(answer.charts[0].rows.length, 5);
   assert.equal(usageRows(), 0);
   guidedConversation = body.conversation;
 });
@@ -231,7 +235,8 @@ await check('Small-model fallback: tools rejected (400) → JSON protocol, <thin
   assert.equal(status, 200, JSON.stringify(body));
   const m = body.conversation.messages[1];
   assert.equal(m.engine, 'model');
-  assert.equal(m.content, 'The leading loss asset is SC-E-101 [AST-1].');
+  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
+  assert.ok(m.content.endsWith('The leading loss asset is SC-E-101 [AST-1].'));
   assert.equal(m.steps.length, 2);
   assert.equal(m.steps[0].tool, 'rank_assets');
   assert.ok(requests[1].body.tools === undefined && requests[2].body.tools === undefined);
@@ -280,7 +285,8 @@ await check("Client case: lazy reply ('provide the asset tag') triggers a forced
   assert.equal(requests[0].body.tool_choice, 'auto');
   assert.equal(requests[1].body.tool_choice, 'required');
   assert.match(requests[1].body.messages.at(-1).content, /full read access/);
-  assert.equal(m.content, 'The top loss driver across all assets is SC-E-101 [AST-1].');
+  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
+  assert.ok(m.content.endsWith('The top loss driver across all assets is SC-E-101 [AST-1].'));
   assert.deepEqual(m.steps.map((s) => s.tool), ['rank_assets']);
   assert.equal(m.warnings.length, 0);
 });
@@ -307,7 +313,8 @@ await check('Priority questions fetch the top loss drivers first; offers like "I
   assert.equal(m.steps[0].tool, 'rank_assets');
   assert.equal(requests.length, 2);
   assert.match(requests[1].body.messages.at(-1).content, /Do not ask the user/);
-  assert.equal(m.content, 'Focus on SC-E-101 [AST-1], the largest actual-loss asset.');
+  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
+  assert.ok(m.content.endsWith('Focus on SC-E-101 [AST-1], the largest actual-loss asset.'));
 });
 
 await check('Write requests get a fixed read-only reply naming the right screen, with no model call', async () => {
@@ -388,8 +395,113 @@ await check('Figure check: a garbled total (real case: 97,395,033,600 for 973,95
   mockModel([{ content: 'Safa Coast actual loss totals 97,395,033,600 USD since 1990.' }]);
   const { body } = await json(await post({ question: 'Show actual loss per year at Safa Coast' }));
   const m = body.conversation.messages[1];
-  assert.match(m.warnings.join(' '), /do not match the data retrieved.*97,395,033,600/);
+  // Displayed (and named in the warning) as the tidied $97.4B.
+  assert.match(m.content, /\$97\.4B/);
+  assert.match(m.warnings.join(' '), /do not match the data retrieved.*97\.4B/);
   assert.equal(m.charts.length, 1, 'the chart itself is still correct and shown');
+});
+
+await check('"Create a tabulated summary" is answered (not refused); creating records is still refused', async () => {
+  const requests = mockModel([{ content: '| Site | Actual loss |\n|---|---|\n| Safa Coast | $271.1M |' }]);
+  const table = (await json(await post({ question: 'Create a tabulated summary' }))).body.conversation.messages[1];
+  assert.equal(requests.length, 1);
+  assert.equal(table.engine, 'model');
+  assert.doesNotMatch(table.content, /read-only/);
+  for (const q of ['Make a chart of failures per year', 'Add a comparison table by site', 'Generate a report of top losses']) {
+    mockModel([{ content: 'Done.' }]);
+    assert.doesNotMatch((await json(await post({ question: q }))).body.conversation.messages[1].content, /read-only/, q);
+  }
+  const before = requests.length;
+  const incident = (await json(await post({ question: 'Create a new incident for SC-E-101' }))).body.conversation.messages[1];
+  assert.match(incident.content, /read-only.*Incidents & MEDFI/s);
+  const action = (await json(await post({ question: 'Please add an action for the pump' }))).body.conversation.messages[1];
+  assert.match(action.content, /read-only.*Recommendations & actions/s);
+  assert.equal(requests.length, before, 'no model call for record changes');
+});
+
+await check('Site comparison: bar chart + table by site, totals equal Bad actors aggregate, no incident IDs given to the model', async () => {
+  const { aggregate } = await load('domain.mjs');
+  const requests = mockModel([{ content: '**Safa Coast drives a third of actual loss.**' }]);
+  const { body } = await json(await post({ question: 'Compare actual loss across sites from 2016 to 2025.' }));
+  const m = body.conversation.messages[1];
+  const chart = m.charts[0];
+  assert.equal(chart.kind, 'ranking');
+  assert.equal(chart.groupBy, 'site');
+  assert.equal(chart.rows.length, 4);
+  const data = JSON.parse(baseline);
+  const rows = data.incidents.filter((e) => +e.date.slice(0, 4) >= 2016 && +e.date.slice(0, 4) <= 2025);
+  const perSite = {};
+  for (const r of aggregate(data, rows)) perSite[r.site] = (perSite[r.site] || 0) + r.loss;
+  for (const row of chart.rows) assert.equal(row.value, Math.round(perSite[row.label]), row.label);
+  assert.ok(chart.rows.every((r, i, a) => i === 0 || a[i - 1].value >= r.value));
+  assert.ok(Math.abs(chart.rows.reduce((s, r) => s + r.share, 0) - 100) < 0.5);
+  const tool = requests[0].body.messages.find((x) => x.role === 'tool').content;
+  assert.doesNotMatch(tool, /RIR-/, 'no incident IDs for portfolio totals');
+});
+
+await check('Follow-up "Create a tabulated summary" re-uses the previous question\'s data (site comparison), not a generic overview', async () => {
+  mockModel([{ content: '**Safa Coast drives about a third of actual loss.**' }]);
+  const first = (await json(await post({ question: 'Compare actual loss across sites from 2016 to 2025.' }))).body.conversation;
+  const requests = mockModel([{ content: '| Site | Actual loss |\n|---|---|\n| Safa Coast | $271.1M |' }]);
+  const second = (await json(await post({ question: 'Create a tabulated summary', conversationId: first.id }))).body.conversation.messages.at(-1);
+  assert.equal(second.steps[0].tool, 'rank_assets');
+  assert.match(second.steps[0].summary, /by site · 2016–2025/);
+  assert.equal(second.charts[0].groupBy, 'site');
+  assert.match(requests[0].body.messages[0].content, /write a real markdown table/);
+  const { isReferentialFollowUp } = await load('assistant-engine.mjs');
+  const data = JSON.parse(baseline);
+  for (const q of ['Create a tabulated summary', 'chart it', 'Summarize that as bullets', 'Can you put this in a table?']) assert.ok(isReferentialFollowUp(q, data), q);
+  for (const q of ['Plot the failure trend for SC-E-101', 'Summarize losses at Safa Coast', 'Table of MTBF by asset']) assert.ok(!isReferentialFollowUp(q, data), q);
+});
+
+await check('Key facts use accurate proportion words (32.6% → "about a third", never "majority")', async () => {
+  const { shareWords } = await load('assistant-tools.mjs');
+  assert.equal(shareWords(32.6), 'about a third (32.6%)');
+  assert.equal(shareWords(8.2), '8.2%');
+  assert.equal(shareWords(55), 'the majority (55%)');
+  const data = deepFreeze(JSON.parse(baseline));
+  const r = runTool('rank_assets', { metric: 'actual_loss', group_by: 'site', from: 2016, to: 2025 }, data, defaultAssumptions);
+  const facts = JSON.parse(r.content).keyFacts;
+  assert.match(facts[0], /^Safa Coast leads actual loss with \$271\.1M, about a third \(32\.6%\) of the \$832\.\dM total across 4 sites\.$/);
+  assert.doesNotMatch(facts.join(' '), /majority/);
+  const t = JSON.parse(runTool('trend_over_time', { metric: 'failures' }, data, defaultAssumptions).content);
+  assert.match(t.direction, /^(broadly flat|rose|fell)/);
+});
+
+await check('Calculated headline replaces the model\'s; overstated words are toned down (real model phrases)', async () => {
+  const { applyHeadline } = await load('assistant-engine.mjs');
+  const H = 'Safa Coast leads actual loss with $271.1M, about a third (32.6%) of the $832.2M total across 4 sites.';
+  const out = applyHeadline('**Safa Coast dominates actual loss across sites.**\n\n- Safa Coast is the dominant site.\n- Top five account for the bulk of losses; one asset drives most loss.', H, 32.6);
+  assert.equal(out, `**${H}**\n\n- Safa Coast is the leading site.\n- Top five account for a large share of losses; one asset drives the largest share of loss.`);
+  assert.equal(applyHeadline('No headline here.', H, 32.6), `**${H}**\n\nNo headline here.`);
+  assert.match(applyHeadline('**X dominates.**', 'X leads.', 62), /\*\*X leads\.\*\*/);
+  assert.equal(applyHeadline('Ann dominates', '', 62), 'Ann dominates', 'no toning down when the share really is a majority');
+  const data = deepFreeze(JSON.parse(baseline));
+  const t = JSON.parse(runTool('trend_over_time', { metric: 'failures' }, data, defaultAssumptions).content);
+  assert.equal(t.headline, 'Downtime events across all sites were broadly flat over 1990–2026, peaking at 104 events in 2023.');
+  const s = JSON.parse(runTool('trend_over_time', { metric: 'actual_loss', site: 'Safa Coast' }, data, defaultAssumptions).content);
+  assert.match(s.headline, /^Actual business loss at Safa Coast (was broadly flat|rose \d+%|fell \d+%) over 1990–2026, peaking at \$35\.6M in 1990\.$/);
+});
+
+await check('MTBF ranking chart uses verified MTBF hours, lowest first', async () => {
+  const data = deepFreeze(JSON.parse(baseline));
+  const r = runTool('query_reliability', { intent: 'mtbf', ascending: true, limit: 5 }, data, defaultAssumptions);
+  assert.equal(r.chart.kind, 'ranking');
+  assert.equal(r.chart.unit, 'hours');
+  assert.equal(r.chart.rows[0].label, 'SC-E-101');
+  assert.equal(r.chart.rows[0].value, 3846);
+  assert.ok(r.chart.rows.every((x, i, a) => i === 0 || a[i - 1].value <= x.value));
+});
+
+await check('Executive number formatting: cents and long USD figures become $271.1M; percentages one decimal', async () => {
+  const { polishAnswer } = await load('assistant-engine.mjs');
+  const data = JSON.parse(baseline);
+  assert.equal(polishAnswer('Safa Coast: $271,145,173.33 (32.58% of total); total 973,950,336 USD; repair $18,500.75.', data), 'Safa Coast: $271.1M (32.6% of total); total $974M; repair $18,501.');
+  // Real model table: money column shortened; share and event columns untouched.
+  const table = polishAnswer('| Site | Actual Loss USD | Share of Total % | F1 events |\n|---|---|---|---|\n| Safa Coast | 271,145,173 | 32.6 | 1,257 |\n| Mizan Bay | 190,090,589 | 22.8 | 1,240 |', data);
+  assert.equal(table, '| Site | Actual Loss USD | Share of Total % | F1 events |\n|---|---|---|---|\n| Safa Coast | $271.1M | 32.6 | 1,257 |\n| Mizan Bay | $190.1M | 22.8 | 1,240 |');
+  const { applyHeadline } = await load('assistant-engine.mjs');
+  assert.equal(applyHeadline('- 32.6% of total, a clear majority among top contributors.', '', 32.6), '- 32.6% of total, the largest share among top contributors.');
 });
 
 await check('Trend questions still get a chart when the model is down', async () => {
@@ -436,8 +548,10 @@ await check('Owner isolation: conversations are private to their owner', async (
   assert.equal((await json(await route.GET())).body.conversations.length, 0);
   assert.equal((await post({ question: 'Continue please', conversationId: guidedConversation.id })).status, 404);
   rt.context('owner-token');
-  // 16 conversations: the follow-up question extended an existing one.
-  assert.equal((await json(await route.GET())).body.conversations.length, 16);
+  // The owner sees exactly their own saved conversations (up to the 30 listed).
+  const saved = rt.sql.prepare("SELECT COUNT(*) n FROM records WHERE owner='owner' AND kind='assistant_chat'").get().n;
+  assert.ok(saved > 10);
+  assert.equal((await json(await route.GET())).body.conversations.length, Math.min(saved, 30));
 });
 
 await check('Rate limit: questions beyond the per-minute limit are refused with 429', async () => {

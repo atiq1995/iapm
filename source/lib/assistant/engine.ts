@@ -6,7 +6,7 @@ import { answerQuery, emptyPlan, parseQuestion } from "@/lib/reliability-agent";
 import { defaultAssumptions, type Assumptions, type Dataset } from "@/lib/domain";
 import type { AssistantConfig } from "./config";
 import { AssistantError, complete, type ChatMessage, type ToolCall } from "./provider";
-import { TOOL_NAMES, TOOL_SPECS, runTool, type Source, type TrendChart } from "./tools";
+import { TOOL_NAMES, TOOL_SPECS, runTool, type AssistantVisual, type Source } from "./tools";
 
 export type Step = { tool: string; summary: string; ok: boolean };
 export type HistoryMessage = { role: "user" | "assistant"; content: string };
@@ -18,7 +18,7 @@ export type AssistantReply = {
   engine: "model" | "guided";
   model?: string;
   notice?: string;
-  charts?: TrendChart[];
+  charts?: AssistantVisual[];
 };
 
 const MAX_ROUNDS = 6;
@@ -58,8 +58,13 @@ Rules:
 - Take each asset's ID from the same tool row as its tag. Never derive IDs from list order.
 - Workspace data is synthetic demonstration data unless a record says otherwise. Live plant systems (DCS, historian, CMMS) are not connected.
 Answer style (strict):
-- Keep every answer under ${cfg.answerWords} words. Lead with the direct answer in one or two sentences.
-- Then at most 5 short bullets with the key figures and cited IDs. Use a table only when the user asks for a list or comparison, with at most 5 rows.
+- Executive style. Keep every answer under ${cfg.answerWords} words.
+- Open with ONE bold headline sentence: the main finding and why it matters (e.g. "**Safa Coast drives about a third of actual loss.**"). Base it on keyFacts or direction when the tool gives them.
+- Words must match the figures: never say "majority", "most" or "dominates" unless a share above 50% supports it; never call a trend both stable and rising.
+- Then at most 3 short bullets of insight: concentration, change over time, gaps between leaders, outliers. When a chart or table is shown, do not repeat every value; it is already on screen.
+- Money as $271.1M or $1.2B; percentages with at most one decimal.
+- If the user asks for a table or tabulated summary, write a real markdown table (header row, at most 6 rows) from the tool data. Otherwise use a table only when no chart already shows the data.
+- For portfolio totals, rankings and comparisons, cite assets, not incident IDs.
 - Refer to assets by tag followed by ID in brackets, e.g. QW-E-209 [AST-109]. Cite incidents as [RIR-…].
 - No introductions, no repeating the question, no offers such as "If you want, I can…", and never mention tool names. Mention the scope (assets, sites, years) in a few words.
 - If the user asks for more detail, you may go longer.
@@ -182,24 +187,53 @@ export function trendRequest(question: string, d: Dataset, assetId: string, site
 }
 
 const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+const compactUSD = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+// $271.1M for millions and above; smaller amounts keep their digits, without cents.
+export function usdShort(n: number) {
+  return Math.abs(n) >= 1e6 ? `$${compactUSD.format(n)}` : `$${Math.round(n).toLocaleString("en-US")}`;
+}
 
 // Chart answer built without the model (no model attached, or the model failed).
-function trendReply(data: Dataset, question: string, notice?: string): AssistantReply | null {
-  if (WRITE_INTENT.test(question)) return null;
-  const plan = parseQuestion(question, data, { ...emptyPlan, from: 1990, to: 2026 });
-  const req = trendRequest(question, data, plan.assetId, plan.site, plan.category);
-  if (!req) return null;
+function visualReply(data: Dataset, question: string, notice?: string): AssistantReply | null {
+  const req = preRetrieve(question, data);
+  if (!req || !["trend_over_time", "rank_assets"].includes(req.name)) return null;
   const out = runTool(req.name, req.args, data, defaultAssumptions);
   if (!out.ok || !out.chart) return null;
   const j = JSON.parse(out.content);
-  const unit = out.chart.unit === "USD" ? " USD" : ` ${out.chart.unit}`;
-  const change = j.changeFirstToLastThirdPct;
-  const lines = [
-    `**${out.chart.title}**`,
-    `Total ${fmt(j.total)}${unit} over ${j.periods} ${out.chart.interval}s.${j.peak ? ` Peak: ${fmt(j.peak.value)}${unit} in ${j.peak.period}.` : ""}`,
-    change === null ? "" : `The average ${change >= 0 ? "rose" : "fell"} ${Math.abs(change)}% from the first third of the period to the last third.`,
-  ];
-  return { answer: lines.filter(Boolean).join("\n\n"), sources: out.sources, steps: [{ tool: req.name, summary: out.summary, ok: true }], warnings: [], engine: "guided", notice, charts: [out.chart] };
+  const c = out.chart;
+  const value = (n: number) => (c.unit === "USD" ? usdShort(n) : `${fmt(n)} ${c.unit}`);
+  let lines: string[];
+  if (c.kind === "trend") {
+    const change = j.changeFirstToLastThirdPct;
+    lines = [
+      `**${c.title}**`,
+      `Total ${value(j.total)} over ${j.periods} ${c.interval}s.${j.peak ? ` Peak: ${value(j.peak.value)} in ${j.peak.period}.` : ""}`,
+      change === null ? "" : `The average ${change >= 0 ? "rose" : "fell"} ${Math.abs(change)}% from the first third of the period to the last third.`,
+    ];
+  } else {
+    const [first, second] = c.rows;
+    lines = [
+      first ? `**${first.label} leads ${c.metric.toLowerCase()} with ${value(first.value)}${c.showShare ? ` (${first.share}% of ${value(c.total)})` : ""}.**` : `**${c.title}**`,
+      second ? `Next: ${second.label} at ${value(second.value)}${c.showShare ? ` (${second.share}%)` : ""}. Scope: ${c.filters.from}–${c.filters.to}.` : "",
+    ];
+  }
+  return { answer: lines.filter(Boolean).join("\n\n"), sources: out.sources, steps: [{ tool: req.name, summary: out.summary, ok: true }], warnings: [], engine: "guided", notice, charts: [c] };
+}
+
+const PRESENTATION = /\b(table|tabulat\w*|summary|summari[sz]e|chart|graph|plot|visuali[sz]e|bullets?|break (?:it|that|this) down)\b/i;
+const SUBJECT = /\b(loss\w*|downtime|mtbf|failures?|incidents?|rirs?|critical\w*|potential|exposure|maintenance|actions?|sites?|categor\w*|assets?|pumps?|exchangers?|motors?|years?|months?|(?:19|20)\d{2})\b/i;
+
+// A short request about presenting the previous answer ("Create a tabulated summary", "chart it"),
+// with no subject of its own.
+export function isReferentialFollowUp(question: string, d: Dataset) {
+  const q = question.toLowerCase();
+  return (
+    q.trim().split(/\s+/).length <= 12 &&
+    PRESENTATION.test(q) &&
+    !SUBJECT.test(q) &&
+    !namedAssets(question, d).length &&
+    ![...new Set(d.assets.map((a) => a.site.toLowerCase()))].some((s) => q.includes(s))
+  );
 }
 
 // Maps common questions to a query to run before the model is called.
@@ -217,6 +251,11 @@ export function preRetrieve(question: string, d: Dataset): { name: string; args:
   if (plan.intent === "help" && !plan.assetId && /\b(focus|priorit\w*|start with|most important|biggest (?:problem|issue|risk)|attention|where should)\b/.test(q))
     return { name: "rank_assets", args: { metric: "actual_loss", ...scope, limit: 5 } };
   if (plan.intent === "help") return plan.assetId ? { name: "get_asset_profile", args: { asset: plan.assetId } } : null;
+  if ((plan.intent === "sites" || plan.intent === "categories") && !plan.assetId)
+    return {
+      name: "rank_assets",
+      args: { metric: /downtime/.test(q) ? "downtime" : /potential|exposure/.test(q) ? "potential_loss" : "actual_loss", group_by: plan.intent === "sites" ? "site" : "category", ...scope },
+    };
   if ((plan.intent === "loss" || plan.intent === "downtime") && !plan.assetId)
     return { name: "rank_assets", args: { metric: plan.intent === "loss" ? "actual_loss" : "downtime", ...scope } };
   return { name: "query_reliability", args: { intent: plan.intent, asset: plan.assetId, ...scope, ascending: plan.ascending } };
@@ -267,6 +306,44 @@ export function unmatchedFigures(answer: string, known: number[]) {
 const numbersIn = (text: string) =>
   [...text.matchAll(/-?\d[\d,]*(?:\.\d+)?/g)].map((m) => Number(m[0].replace(/,/g, ""))).filter(Number.isFinite);
 
+// Calculated headline and leader share from a chart tool's output.
+function headlineOf(content: string, headline: string, share: number | undefined) {
+  try {
+    const j = JSON.parse(content) as { headline?: unknown; leaderSharePct?: unknown };
+    return {
+      headline: typeof j.headline === "string" && j.headline ? j.headline : headline,
+      leaderShare: typeof j.leaderSharePct === "number" ? j.leaderSharePct : share,
+    };
+  } catch {
+    return { headline, leaderShare: share };
+  }
+}
+
+// The headline is the one sentence executives read first, so it comes from the calculation,
+// not the model. When no item holds more than half the total, overstated words are toned down.
+export function applyHeadline(answer: string, headline: string, leaderShare?: number) {
+  let text = answer;
+  if (headline) {
+    const lines = text.split("\n");
+    const first = lines.findIndex((l) => l.trim());
+    if (first >= 0 && /^\s*\*\*[^*]+\*\*/.test(lines[first])) lines[first] = `**${headline}**`;
+    else lines.unshift(`**${headline}**`, "");
+    text = lines.join("\n");
+  }
+  if (leaderShare !== undefined && leaderShare <= 50) {
+    text = text
+      .replace(/\bdominates\b/gi, "leads")
+      .replace(/\bdominate\b/gi, "lead")
+      .replace(/\bdominating\b/gi, "leading")
+      .replace(/\bdominant\b/gi, "leading")
+      .replace(/\bthe (?:vast )?majority of\b/gi, "a large share of")
+      .replace(/\b(?:a|the) (?:clear |vast |strong )?majority\b/gi, "the largest share")
+      .replace(/\bthe bulk of\b/gi, "a large share of")
+      .replace(/\bmost (?:of the )?(loss|losses)\b/gi, "the largest share of $1");
+  }
+  return text;
+}
+
 const TOOL_WORDS: Record<string, string> = {
   rank_assets: "the asset ranking",
   trend_over_time: "the trend chart",
@@ -297,6 +374,29 @@ export function polishAnswer(answer: string, d: Dataset) {
     .split("\n")
     .filter((line) => !/\b(copied exactly|from display|no reformatting|tool results?)\b/i.test(line))
     .join("\n");
+  // Executive figures: "$271,145,173.33" or "271,145,173 USD" → "$271.1M"; "32.58%" → "32.6%".
+  text = text.replace(/\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?)/g, (_, n: string) => usdShort(Number(n.replace(/,/g, ""))));
+  text = text.replace(/\b(\d{1,3}(?:,\d{3}){2,}(?:\.\d+)?)\s?USD\b/g, (_, n: string) => usdShort(Number(n.replace(/,/g, ""))));
+  text = text.replace(/(\$[\d.,]+[KMBT]?)\s?USD\b/g, "$1");
+  text = text.replace(/\b(\d+\.\d{2,})%/g, (_, n: string) => `${Number(n).toFixed(1)}%`);
+  // In markdown tables, million-plus figures in money columns (USD, loss, cost, exposure) → $271.1M.
+  let moneyColumns: boolean[] = [];
+  text = text
+    .split("\n")
+    .map((line, i, all) => {
+      if (!line.trim().startsWith("|")) {
+        moneyColumns = [];
+        return line;
+      }
+      const cells = line.trim().replace(/^\||\|$/g, "").split("|");
+      if (/^\s*\|?\s*:?-{2,}/.test(all[i + 1] || "")) {
+        moneyColumns = cells.map((c) => /usd|\$|loss|cost|exposure|spend/i.test(c));
+        return line;
+      }
+      if (!moneyColumns.length || /^\s*\|?\s*:?-{2,}/.test(line)) return line;
+      return "|" + cells.map((c, j) => (moneyColumns[j] ? c.replace(/^\s*\$?\s?(\d{1,3}(?:,\d{3}){2,}(?:\.\d+)?)\s*$/, (_, n: string) => ` ${usdShort(Number(n.replace(/,/g, "")))} `) : c)).join("|") + "|";
+    })
+    .join("\n");
   // Plain wording instead of internal tool names.
   for (const [tool, words] of Object.entries(TOOL_WORDS)) text = text.split(tool).join(words);
   return text;
@@ -304,7 +404,9 @@ export function polishAnswer(answer: string, d: Dataset) {
 
 const LAZY =/\b(provide|specify|confirm|clarify|which asset|asset tag|cannot|can't|can not|unable|don't have|do not have|no access|if you (?:want|like|wish)|would you like|i can (?:fetch|look|pull|run|check|retrieve)|let me know)\b|without (?:running|a|any) /i;
 // A request to change data, e.g. "delete…", "please update…", "can you approve…".
-const WRITE_INTENT = /^\s*(?:please\s+)?(?:(?:can|could|would) you\s+)?(?:please\s+)?(?:delete|remove|edit|change|modify|update|approve|create|add|close|reset|rename|archive)\b/i;
+// "Create a table / summary / chart" is a read request: create/add count only when aimed at records.
+const WRITE_INTENT =
+  /^\s*(?:please\s+)?(?:(?:can|could|would) you\s+)?(?:please\s+)?(?:(?:delete|remove|edit|change|modify|update|approve|close|reset|rename|archive)\b|(?:create|add|record|register|log|insert)\b(?=.{0,40}\b(?:assets?|incidents?|rirs?|records?|actions?|assessments?|scenarios?|users?|accounts?|entr(?:y|ies)|failures?|events?)\b)(?!.{0,40}\b(?:table|summary|chart|graph|plot|report|list|overview|breakdown|comparison|trend|view)\b))/i;
 
 // When the question names exactly one asset, keep it in queries the model sends without an asset.
 function pinAsset(call: ToolCall, assetId: string | null, question: string): ToolCall {
@@ -344,8 +446,10 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
     { role: "user", content: question + (hints.length ? `\n\n[Context: assets mentioned: ${hints.join("; ")}]` : "") },
   ];
   const steps: Step[] = [];
-  const charts: TrendChart[] = [];
+  const charts: AssistantVisual[] = [];
   const known: number[] = [];
+  let headline = "";
+  let leaderShare: number | undefined;
   const sources = new Map<string, Source>();
   let answer = "";
   let calls = 0;
@@ -361,7 +465,9 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
   // Retrieval first: when the question maps to a known query, fetch the data
   // before the model sees it, so the answer starts from database facts even
   // if a small model would not have called a tool by itself.
-  const pre = preRetrieve(question, data);
+  // "Make a table" / "chart it" after a question re-uses that question's data.
+  const earlier = [...history].reverse().find((m) => m.role === "user" && !isReferentialFollowUp(m.content, data))?.content;
+  const pre = (earlier && isReferentialFollowUp(question, data) ? preRetrieve(earlier, data) : null) ?? preRetrieve(question, data);
   if (pre) {
     const outcome = runTool(pre.name, pre.args, data, assumptions);
     if (outcome.ok) {
@@ -373,6 +479,7 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
       for (const s of outcome.sources) sources.set(s.id, s);
       if ("chart" in outcome && outcome.chart) charts.push(outcome.chart);
       known.push(...numbersIn(outcome.content));
+      if ("chart" in outcome && outcome.chart) ({ headline, leaderShare } = headlineOf(outcome.content, headline, leaderShare));
       if (jsonMode) {
         messages.push({ role: "assistant", content: JSON.stringify({ tool: pre.name, arguments: pre.args }) });
         messages.push({ role: "user", content: `TOOL RESULT (${pre.name}): ${outcome.content}\n\nUse these results. Reply with another tool call JSON or {"answer": "..."}.` });
@@ -435,6 +542,7 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
       for (const s of outcome.sources) sources.set(s.id, s);
       if ("chart" in outcome && outcome.chart) charts.push(outcome.chart);
       known.push(...numbersIn(outcome.content));
+      if ("chart" in outcome && outcome.chart) ({ headline, leaderShare } = headlineOf(outcome.content, headline, leaderShare));
       if (viaText) results.push(`TOOL RESULT (${call.function.name}): ${outcome.content}`);
       else messages.push({ role: "tool", tool_call_id: call.id, content: outcome.content });
     }
@@ -454,7 +562,7 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
     const obj = jsonMode ? parseJSONObject(content) : null;
     answer = typeof obj?.answer === "string" ? obj.answer : content;
   }
-  answer = polishAnswer(answer.trim(), data).slice(0, MAX_ANSWER);
+  answer = applyHeadline(polishAnswer(answer.trim(), data), headline, leaderShare).slice(0, MAX_ANSWER);
   if (!answer) throw new AssistantError("The AI model returned an empty answer. Rephrase the question and retry.", 502);
 
   const checked = verifyCitations(answer, [...sources.values()], data);
@@ -480,8 +588,8 @@ export async function runAssistant(input: RunInput): Promise<AssistantReply> {
 const cell = (v: string) => v.replace(/\|/g, "/").replace(/\n/g, " ");
 
 export function guidedReply(data: Dataset, question: string, assumptions: Assumptions, notice?: string): AssistantReply {
-  const trend = trendReply(data, question, notice);
-  if (trend) return trend;
+  const visual = visualReply(data, question, notice);
+  if (visual) return visual;
   const plan = parseQuestion(question, data, { ...emptyPlan, from: 1990, to: 2026 });
   const r = answerQuery(data, plan, assumptions);
   const parts = [`**${r.title}**`, r.answer];

@@ -24,7 +24,20 @@ export type TrendChart = {
   points: { period: string; value: number }[];
   filters: { site: string; category: string; asset: string; mode: string; from: number; to: number };
 };
-export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string; chart?: TrendChart };
+// Ranking/comparison shown as a horizontal bar chart plus a table.
+export type RankingChart = {
+  kind: "ranking";
+  title: string;
+  metric: string;
+  unit: string;
+  groupBy: "asset" | "site" | "category";
+  total: number;
+  showShare: boolean;
+  rows: { label: string; value: number; share: number; id?: string; sub?: string }[];
+  filters: { site: string; category: string; asset: string; mode: string; from: number; to: number };
+};
+export type AssistantVisual = TrendChart | RankingChart;
+export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string; chart?: AssistantVisual };
 
 export const TOOL_NAMES = ["rank_assets", "trend_over_time", "query_reliability", "search_incidents", "get_asset_profile"] as const;
 
@@ -64,11 +77,12 @@ export const TOOL_SPECS = [
     function: {
       name: "rank_assets",
       description:
-        "Rank ALL assets (no asset tag needed) by a metric. Use first for any 'top', 'worst', 'highest', 'biggest', 'loss driver' or 'bad actor' question. Metrics: actual_loss (approved F1 USD), potential_loss (estimated F2 exposure USD; never add to actual), downtime, potential_downtime, maintenance (USD), events (F1 count). Optional site, category and years.",
+        "Rank or compare by a metric, shown to the user as a bar chart and table. group_by asset (default; no tag needed), site or category. Use for any 'top', 'worst', 'highest', 'loss driver', 'bad actor' or 'compare sites/categories' question. Metrics: actual_loss (approved F1 USD), potential_loss (estimated F2 exposure USD; never add to actual), downtime, potential_downtime, maintenance (USD), events (F1 count). Optional site, category and years.",
       parameters: {
         type: "object",
         properties: {
           metric: { type: "string", enum: Object.keys(RANK_METRICS) },
+          group_by: { type: "string", enum: ["asset", "site", "category"], description: "Default asset." },
           site: { type: "string", description: "Site name, or empty for all sites." },
           category: { type: "string", description: "Equipment, Machinery, Instrumentation or Electrical; empty for all." },
           from: { type: "integer", description: "First incident year, default 1990." },
@@ -159,6 +173,17 @@ export const TOOL_SPECS = [
 
 export class ToolInputError extends Error {}
 
+// Plain-English proportion words, so headlines match the figures ("about a third", not "the majority").
+export function shareWords(pct: number) {
+  if (pct > 50) return `the majority (${pct}%)`;
+  if (pct >= 45) return `nearly half (${pct}%)`;
+  if (pct >= 37) return `over a third (${pct}%)`;
+  if (pct >= 30) return `about a third (${pct}%)`;
+  if (pct >= 20) return `about a quarter (${pct}%)`;
+  return `${pct}%`;
+}
+const money = (n: number) => (Math.abs(n) >= 1e6 ? `$${new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n)}` : `$${Math.round(n).toLocaleString("en-US")}`);
+
 export function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -228,8 +253,30 @@ function queryReliability(d: Dataset, args: Record<string, unknown>, assumptions
     d,
   );
   const r = answerQuery(d, plan, assumptions);
+  let chart: RankingChart | undefined;
+  if (intent === "mtbf") {
+    const rowsWithHours = r.rows
+      .map((row) => ({ row, a: d.assets.find((x) => x.id === row.assetId) }))
+      .map(({ row, a }) => ({ row, a, h: a ? assetMTBF(a, d.incidents).hours : null }))
+      .filter((x): x is { row: typeof x.row; a: Asset; h: number } => !!x.a && x.h !== null)
+      .slice(0, 10);
+    if (rowsWithHours.length)
+      chart = {
+        kind: "ranking",
+        title: `MTBF · ${plan.ascending ? "lowest" : "highest"} first · ${plan.site || "all sites"}`,
+        metric: "MTBF",
+        unit: "hours",
+        groupBy: "asset",
+        total: 0,
+        showShare: false,
+        rows: rowsWithHours.map(({ a, h }) => ({ label: a.tag, value: Math.round(h), share: 0, id: a.id, sub: `${a.site} · ${a.category}` })),
+        filters: { site: plan.site, category: plan.category, asset: "", mode: "", from: plan.from, to: plan.to },
+      };
+  }
+  // Portfolio totals cite assets, not a sample of incidents (which would look like per-row evidence).
+  const citable = ["incidents", "modes", "actions", "criticality", "mtbf"].includes(intent) ? r.sources.slice(0, 40).map((s) => s.id) : [];
   const scope = `${intent}${asset ? " · " + asset.tag : ""}${plan.site ? " · " + plan.site : ""}${plan.category ? " · " + plan.category : ""} · ${plan.from}–${plan.to}`;
-  return finish(
+  const outcome = finish(
     {
       title: r.title,
       result: r.answer,
@@ -238,16 +285,37 @@ function queryReliability(d: Dataset, args: Record<string, unknown>, assumptions
       columns: ["ID", ...r.columns],
       rows: r.rows.slice(0, 20).map((row) => [row.incidentId || row.assetId || "", ...row.values]),
       supportingRecords: r.sourceCount,
-      citableIds: r.sources.slice(0, 40).map((s) => s.id),
+      citableIds: citable,
     },
     r.sources,
     scope,
   );
+  return chart ? { ...outcome, chart } : outcome;
+}
+
+function rankFacts(
+  top: { name: string; value: number }[],
+  total: number,
+  label: string,
+  unit: string,
+  round: (n: number) => number,
+  share: (n: number) => number,
+  count: number,
+  groupBy: string,
+) {
+  const v = (n: number) => (unit === "USD" ? money(round(n)) : `${round(n).toLocaleString("en-US")} ${unit}`);
+  const [a, b] = top;
+  if (!a) return [];
+  const facts = [`${a.name} leads ${label.toLowerCase()} with ${v(a.value)}, ${shareWords(share(a.value))} of the ${v(total)} total across ${count} ${groupBy === "asset" ? "assets" : groupBy === "site" ? "sites" : "categories"}.`];
+  if (b) facts.push(`Next: ${b.name} with ${v(b.value)} (${share(b.value)}%); the leader is ${b.value ? (a.value / b.value).toFixed(1) : "n/a"}× the runner-up.`);
+  if (top.length >= 3) facts.push(`Top 3 together: ${Math.round(top.slice(0, 3).reduce((s, r) => s + share(r.value), 0))}% of the total.`);
+  return facts;
 }
 
 function rankAssets(d: Dataset, args: Record<string, unknown>): ToolOutcome {
   const metric = text(args.metric, 30) as RankMetric;
   if (!(metric in RANK_METRICS)) throw new ToolInputError(`Unsupported metric. Use one of: ${Object.keys(RANK_METRICS).join(", ")}.`);
+  const groupBy = (["site", "category"].includes(text(args.group_by, 20)) ? text(args.group_by, 20) : "asset") as "asset" | "site" | "category";
   const site = resolveOption([...new Set(d.assets.map((a) => a.site))], args.site, "site");
   const category = resolveOption([...new Set(d.assets.map((a) => a.category))], args.category, "category");
   const { from, to } = years(args);
@@ -255,39 +323,73 @@ function rankAssets(d: Dataset, args: Record<string, unknown>): ToolOutcome {
   const ids = new Set(d.assets.filter((a) => (!site || a.site === site) && (!category || a.category === category)).map((a) => a.id));
   const rows = d.incidents.filter((e) => ids.has(e.assetId) && +e.date.slice(0, 4) >= from && +e.date.slice(0, 4) <= to);
   const { field, label } = RANK_METRICS[metric];
-  const value = (r: Record<string, unknown>) => Number(r[field]) || 0;
-  const ranked = aggregate(d, rows)
-    .filter((r) => ids.has(r.id))
-    .sort((a, b) => value(b) - value(a));
-  const total = sum(ranked.map(value));
+  const unit = metric.includes("downtime") ? "days" : metric === "events" ? "events" : "USD";
+  const round = (n: number) => (unit === "days" ? Math.round(n * 10) / 10 : Math.round(n));
+  const perAsset = aggregate(d, rows).filter((r) => ids.has(r.id));
+  // Group per asset (default), or sum the same per-asset figures by site or category.
+  type Row = { key: string; name: string; value: number; loss: number; potential: number; events: number; secondary: number; assets: number; site?: string; category?: string; tag?: string };
+  const grouped = new Map<string, Row>();
+  for (const r of perAsset) {
+    const key = groupBy === "asset" ? r.id : groupBy === "site" ? r.site : r.category;
+    const g = grouped.get(key) || { key, name: groupBy === "asset" ? r.tag : key, value: 0, loss: 0, potential: 0, events: 0, secondary: 0, assets: 0, ...(groupBy === "asset" ? { site: r.site, category: r.category, tag: r.tag } : {}) };
+    g.value += Number((r as Record<string, unknown>)[field]) || 0;
+    g.loss += r.loss;
+    g.potential += r.potential;
+    g.events += r.events;
+    g.secondary += r.secondary;
+    g.assets += 1;
+    grouped.set(key, g);
+  }
+  const ranked = [...grouped.values()].sort((a, b) => b.value - a.value);
+  const total = sum(ranked.map((r) => r.value));
   const top = ranked.slice(0, limit);
-  const round = (n: number) => (metric.includes("downtime") ? Math.round(n * 10) / 10 : Math.round(n));
-  return finish(
-    {
-      metric: label,
-      scope: { site: site || "all sites", category: category || "all categories", from, to, assetsRanked: ranked.length },
-      portfolioTotal: round(total),
-      ranking: top.map((r, i) => ({
-        rank: i + 1,
-        id: r.id,
-        tag: r.tag,
-        site: r.site,
-        category: r.category,
-        value: round(value(r)),
-        shareOfTotalPct: total ? Math.round((value(r) / total) * 1000) / 10 : 0,
-        actualLossUSD: Math.round(r.loss),
-        potentialExposureUSD: Math.round(r.potential),
-        f1Events: r.events,
-        f2Records: r.secondary,
-      })),
-      notes: [
-        "Uses approved/closed records only, the same calculation as the Bad actors screen.",
-        "Potential exposure is an estimate: average loss of earlier matching F1 events (same failure mode, category and service) × 1.3 uncertainty. It is never added to actual loss.",
-      ],
-    },
-    top.map((r) => ({ id: r.id, label: `${r.tag} · ${r.site}`, assetId: r.id })),
-    `rank ${metric}${site ? " · " + site : ""}${category ? " · " + category : ""} · ${from}–${to}`,
-  );
+  const share = (v: number) => (total ? Math.round((v / total) * 1000) / 10 : 0);
+  const scopeText = [site || (groupBy === "site" ? "" : "all sites"), category].filter(Boolean).join(" · ") || "portfolio";
+  // Display name without the technical qualifiers: "Actual loss (approved F1) · USD" → "Actual loss".
+  const shortLabel = label.replace(/\s*\(.*?\)/g, "").replace(/\s*·.*$/, "");
+  const chart: RankingChart = {
+    kind: "ranking",
+    title: `${shortLabel} by ${groupBy} · ${scopeText} · ${from}–${to}`,
+    metric: shortLabel,
+    unit,
+    groupBy,
+    total: round(total),
+    showShare: true,
+    rows: top.slice(0, 10).map((r) => ({ label: r.name, value: round(r.value), share: share(r.value), ...(groupBy === "asset" ? { id: r.key, sub: `${r.site} · ${r.category}` } : { sub: `${r.assets} assets` }) })),
+    filters: { site, category, asset: "", mode: "", from, to },
+  };
+  return {
+    ...finish(
+      {
+        metric: label,
+        groupedBy: groupBy,
+        scope: { site: site || "all sites", category: category || "all categories", from, to, itemsRanked: ranked.length },
+        portfolioTotal: round(total),
+        keyFacts: rankFacts(top, total, shortLabel, unit, round, share, ranked.length, groupBy),
+        // Calculated headline (the leader's key fact); the engine shows it instead of the model's own.
+        headline: rankFacts(top, total, shortLabel, unit, round, share, ranked.length, groupBy)[0] ?? "",
+        leaderSharePct: top[0] ? share(top[0].value) : 0,
+        ranking: top.map((r, i) => ({
+          rank: i + 1,
+          ...(groupBy === "asset" ? { id: r.key, tag: r.tag, site: r.site, category: r.category } : { name: r.name, assets: r.assets }),
+          value: round(r.value),
+          shareOfTotalPct: share(r.value),
+          actualLossUSD: Math.round(r.loss),
+          potentialExposureUSD: Math.round(r.potential),
+          f1Events: r.events,
+          f2Records: r.secondary,
+        })),
+        notes: [
+          "The user already sees a bar chart and table of this ranking. Give the headline insight (leader, concentration, gaps); do not repeat every row.",
+          "Uses approved/closed records only, the same calculation as the Bad actors screen.",
+          "Potential exposure is an estimate: average loss of earlier matching F1 events (same failure mode, category and service) × 1.3 uncertainty. It is never added to actual loss.",
+        ],
+      },
+      groupBy === "asset" ? top.map((r) => ({ id: r.key, label: `${r.tag} · ${r.site}`, assetId: r.key })) : [],
+      `rank ${metric} by ${groupBy}${site ? " · " + site : ""}${category ? " · " + category : ""} · ${from}–${to}`,
+    ),
+    chart,
+  };
 }
 
 function trendOverTime(d: Dataset, args: Record<string, unknown>): ToolOutcome {
@@ -352,9 +454,17 @@ function trendOverTime(d: Dataset, args: Record<string, unknown>): ToolOutcome {
     points,
     filters: { site, category, asset: asset?.id ?? "", mode, from, to },
   };
+  // Calculated headline: the engine shows this instead of the model's own first sentence.
+  const pct = early > 0 ? Math.round(((late - early) / early) * 100) : null;
+  const verb = /events|records/i.test(meta.label) ? "were" : "was";
+  const movement = pct === null ? ` ${verb} recorded` : Math.abs(pct) < 5 ? ` ${verb} broadly flat` : ` ${pct > 0 ? "rose" : "fell"} ${Math.abs(pct)}%`;
+  const where = asset ? ` for ${asset.tag}` : site ? ` at ${site}` : category ? ` for ${category}` : " across all sites";
+  const peakText = peak && peak.value > 0 ? `, peaking at ${meta.unit === "USD" ? money(peak.value) : `${peak.value.toLocaleString("en-US")} ${meta.unit}`} in ${peak.period}` : "";
+  const headline = `${meta.label}${where}${mode ? ` (${mode})` : ""}${movement} over ${from}–${to}${peakText}.`;
   return {
     ...finish(
       {
+        headline,
         metric: `${meta.label} (${meta.unit})`,
         interval,
         scope: { asset: asset?.tag ?? "all assets", site: site || "all sites", category: category || "all categories", failureMode: mode || "all modes", from, to },
@@ -366,6 +476,12 @@ function trendOverTime(d: Dataset, args: Record<string, unknown>): ToolOutcome {
         firstThirdAverage: round(early),
         lastThirdAverage: round(late),
         changeFirstToLastThirdPct: early > 0 ? Math.round(((late - early) / early) * 100) : null,
+        direction:
+          early > 0
+            ? Math.abs((late - early) / early) < 0.05
+              ? `broadly flat (${Math.round(((late - early) / early) * 100)}% from the first third of the period to the last)`
+              : `${late > early ? "rose" : "fell"} ${Math.abs(Math.round(((late - early) / early) * 100))}% from the first third of the period to the last`
+            : "not enough early data to judge direction",
         latest: points.slice(-3),
         // Pre-formatted figures for the answer text, so long numbers are copied, not retyped.
         display: {
