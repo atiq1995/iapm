@@ -151,14 +151,16 @@ await check('Model tool loop: read-only tools, rejected write tool, verified cit
   assert.equal(requests.length, 3);
   assert.equal(requests[0].url, 'https://model.test/v1/chat/completions');
   assert.equal(requests[0].body.model, 'relia-core-8b');
-  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['query_reliability', 'search_incidents', 'get_asset_profile']);
+  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['rank_assets', 'query_reliability', 'search_incidents', 'get_asset_profile']);
   assert.ok(!('Authorization' in requests[0].headers), 'no key configured, so no auth header');
-  assert.match(requests[0].body.messages.at(-1).content, /SC-E-101 = AST-1/);
-  const toolMsg = requests[1].body.messages.find((x) => x.role === 'tool');
+  assert.match(requests[0].body.messages.find((x) => x.role === 'user').content, /SC-E-101 = AST-1/);
+  assert.equal(requests[0].body.messages.at(-1).role, 'tool', 'data retrieved before the first model call');
+  const toolMsg = requests[1].body.messages.filter((x) => x.role === 'tool').at(-1);
   assert.match(toolMsg.content, /"tag":"SC-E-101"/);
   const rejected = requests[2].body.messages.filter((x) => x.role === 'tool').at(-1);
   assert.match(rejected.content, /does not exist/);
-  assert.deepEqual(m.steps.map((s) => s.ok), [true, false]);
+  assert.deepEqual(m.steps.map((s) => s.ok), [true, true, false]);
+  assert.match(m.steps[0].summary, /^auto · /);
   assert.ok(m.sources.some((s) => s.id === 'AST-1'));
   assert.ok(m.sources.some((s) => s.id === assetOne));
   assert.match(m.warnings.join(' '), /RIR-99999/);
@@ -229,7 +231,8 @@ await check('Small-model fallback: tools rejected (400) → JSON protocol, <thin
   const m = body.conversation.messages[1];
   assert.equal(m.engine, 'model');
   assert.equal(m.content, 'The leading loss asset is SC-E-101 [AST-1].');
-  assert.equal(m.steps.length, 1);
+  assert.equal(m.steps.length, 2);
+  assert.equal(m.steps[0].tool, 'rank_assets');
   assert.ok(requests[1].body.tools === undefined && requests[2].body.tools === undefined);
   assert.match(requests[1].body.messages[0].content, /TOOLS\. To call a tool/);
   assert.match(requests[2].body.messages.at(-1).content, /TOOL RESULT \(query_reliability\)/);
@@ -244,8 +247,96 @@ await check('Tool call written as text (<tool_call>) is executed', async () => {
   ]);
   const { body } = await json(await post({ question: 'Show seal leakage history' }));
   const m = body.conversation.messages[1];
-  assert.equal(m.steps[0].tool, 'search_incidents');
-  assert.ok(m.sources.length > 0 && m.sources.length <= 3);
+  assert.equal(m.steps[1].tool, 'search_incidents');
+  assert.ok(m.sources.length > 0);
+});
+
+await check("Client case: potential-loss question is answered from the database before the model is asked", async () => {
+  const requests = mockModel([{ content: 'Highest potential exposure: see ranking [AST-1].' }]);
+  const { status, body } = await json(await post({ question: 'Identify the asset with the highest potential business loss' }));
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(requests.length, 1);
+  const tool = requests[0].body.messages.find((x) => x.role === 'tool');
+  const result = JSON.parse(tool.content);
+  assert.match(result.metric, /Potential exposure/);
+  assert.equal(result.scope.site, 'all sites');
+  assert.ok(result.ranking.length > 0 && result.ranking[0].value > 0);
+  assert.ok(result.ranking.every((r, i, a) => i === 0 || a[i - 1].value >= r.value), 'sorted highest first');
+  assert.equal(body.conversation.messages[1].steps[0].tool, 'rank_assets');
+  assert.equal(body.conversation.messages[1].warnings.length, 0);
+});
+
+await check("Client case: lazy reply ('provide the asset tag') triggers a forced database query", async () => {
+  const requests = mockModel([
+    { content: 'Please provide the asset tag so I can look it up.' },
+    { content: null, tool_calls: [{ id: 'g1', type: 'function', function: { name: 'rank_assets', arguments: '{"metric":"actual_loss","limit":3}' } }] },
+    { content: 'The top loss driver across all assets is SC-E-101 [AST-1].' },
+  ]);
+  const { status, body } = await json(await post({ question: 'Give me a quick read on this workspace please' }));
+  assert.equal(status, 200, JSON.stringify(body));
+  const m = body.conversation.messages[1];
+  assert.equal(requests.length, 3);
+  assert.equal(requests[0].body.tool_choice, 'auto');
+  assert.equal(requests[1].body.tool_choice, 'required');
+  assert.match(requests[1].body.messages.at(-1).content, /full read access/);
+  assert.equal(m.content, 'The top loss driver across all assets is SC-E-101 [AST-1].');
+  assert.deepEqual(m.steps.map((s) => s.tool), ['rank_assets']);
+  assert.equal(m.warnings.length, 0);
+});
+
+await check('A named asset stays pinned when the model drops it from a query', async () => {
+  const requests = mockModel([
+    { content: null, tool_calls: [{ id: 'p1', type: 'function', function: { name: 'query_reliability', arguments: '{"intent":"modes"}' } }] },
+    { content: 'SC-E-101 [AST-1] fails mostly from seal leakage.' },
+  ]);
+  const { body } = await json(await post({ question: 'Why does SC-E-101 keep failing?' }));
+  const m = body.conversation.messages[1];
+  assert.deepEqual(m.steps.map((s) => s.tool), ['query_reliability', 'query_reliability']);
+  assert.match(m.steps[1].summary, /SC-E-101/, 'second query kept the asset');
+  assert.match(requests[1].body.messages.at(-1).content, /SC-E-101/);
+});
+
+await check('Priority questions fetch the top loss drivers first; offers like "If you want, I can…" are retried', async () => {
+  const requests = mockModel([
+    { content: 'Focus on SC-E-101 [AST-1]. If you want, I can fetch more details.' },
+    { content: 'Focus on SC-E-101 [AST-1], the largest actual-loss asset.' },
+  ]);
+  const { body } = await json(await post({ question: 'What should I focus on first?' }));
+  const m = body.conversation.messages[1];
+  assert.equal(m.steps[0].tool, 'rank_assets');
+  assert.equal(requests.length, 2);
+  assert.match(requests[1].body.messages.at(-1).content, /Do not ask the user/);
+  assert.equal(m.content, 'Focus on SC-E-101 [AST-1], the largest actual-loss asset.');
+});
+
+await check('Write requests get a fixed read-only reply naming the right screen, with no model call', async () => {
+  const requests = mockModel([]);
+  const incidents = (await json(await post({ question: 'Please delete all draft incidents now' }))).body.conversation.messages[1];
+  assert.equal(requests.length, 0);
+  assert.match(incidents.content, /read-only/);
+  assert.match(incidents.content, /Incidents & MEDFI/);
+  const asset = (await json(await post({ question: 'Delete asset SC-E-101' }))).body.conversation.messages[1];
+  assert.match(asset.content, /Asset register/);
+  assert.equal(requests.length, 0);
+});
+
+await check('Wrong tag/ID pairs written by the model are corrected; tool names are replaced', async () => {
+  const { polishAnswer } = await load('assistant-engine.mjs');
+  const data = JSON.parse(baseline);
+  const tag2 = data.assets.find((a) => a.id === 'AST-2').tag;
+  const out = polishAnswer('SC-E-101 [AST-7] and AST-9 (SC-E-101) and ' + tag2 + ' [AST-2]. Source: rank_assets.', data);
+  assert.equal(out, `SC-E-101 [AST-1] and AST-1 (SC-E-101) and ${tag2} [AST-2]. Source: the asset ranking.`);
+});
+
+await check('rank_assets matches the Bad actors calculation and rejects bad input', () => {
+  const data = deepFreeze(JSON.parse(baseline));
+  const r = runTool('rank_assets', { metric: 'potential_loss', site: 'safa coast', limit: 5 }, data, defaultAssumptions);
+  assert.equal(r.ok, true, r.content);
+  const j = JSON.parse(r.content);
+  assert.equal(j.ranking.length, 5);
+  assert.ok(j.ranking.every((x) => x.site === 'Safa Coast'));
+  assert.equal(r.sources.length, 5);
+  assert.equal(runTool('rank_assets', { metric: 'profit' }, data, defaultAssumptions).ok, false);
 });
 
 await check('Model unreachable → guided answer with a visible notice', async () => {
@@ -281,8 +372,8 @@ await check('Owner isolation: conversations are private to their owner', async (
   assert.equal((await json(await route.GET())).body.conversations.length, 0);
   assert.equal((await post({ question: 'Continue please', conversationId: guidedConversation.id })).status, 404);
   rt.context('owner-token');
-  // 7 conversations: the follow-up question extended an existing one.
-  assert.equal((await json(await route.GET())).body.conversations.length, 7);
+  // 13 conversations: the follow-up question extended an existing one.
+  assert.equal((await json(await route.GET())).body.conversations.length, 13);
 });
 
 clearModelEnv();

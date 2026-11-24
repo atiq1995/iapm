@@ -16,6 +16,8 @@ Language model  ◄──── tool results (JSON) ────┐
    │  asks for a tool                          │
    ▼                                           │
 Read-only tools (lib/assistant/tools.ts) ──────┘
+   rank_assets        → portfolio ranking: actual loss, potential (F2) exposure, downtime, maintenance, events
+                        (same calculation as the Bad actors screen)
    query_reliability  → shared iAPM engine (loss, MTBF, criticality, MEDFI, sites, economics, forecast)
    search_incidents   → keyword search over RIR narratives, causes, actions
    get_asset_profile  → one asset: register, MTBF, loss, stages, failure modes, open actions
@@ -24,6 +26,11 @@ Read-only tools (lib/assistant/tools.ts) ──────┘
 Answer → citation check (every RIR/AST/ACT ID must exist) → saved conversation
 ```
 
+* **Retrieval first.** Common questions (losses, potential exposure, MTBF, incidents, priorities, one named asset) are answered from data fetched *before* the model is called, so even a small model starts from database facts.
+* **No lazy answers.** If the model answers without data, asks the user for an asset tag, or offers "If you want, I can…", it is sent back once and required to query.
+* **Named asset stays pinned.** When the question names one asset, queries the model sends without an asset keep that asset.
+* **Change requests** ("delete…", "approve…") get a fixed read-only reply naming the right iAPM screen, without calling the model.
+* **ID correction.** Every "TAG [AST-n]" pair in an answer is checked against the register and corrected if the model mismatched them.
 * **Numbers come from the iAPM engine**, never from the model. The model only chooses tools and writes the explanation.
 * **Read-only by construction.** Tools receive a frozen in-memory copy of the data and no database handle. Unknown tool names (for example `delete_asset`) are rejected. The route writes only the owner's conversation history (`assistant_chat`) and the usage ledger (`ai_usage`).
 * **Hallucination check.** Any cited record ID that does not exist is shown in amber as *unverified*, with a warning under the answer. Real IDs become clickable and open the record.
@@ -91,7 +98,7 @@ Check each provider's current documentation for exact model IDs before going liv
 node tests/assistant.test.mjs
 ```
 
-14 checks: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
+22 checks: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
 
 ## Production notes
 

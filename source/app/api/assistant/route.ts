@@ -15,7 +15,7 @@ import { putRecord, readRecords } from "@/lib/ai-service";
 import { assumptionsSchema } from "@/lib/validation";
 import { defaultAssumptions } from "@/lib/domain";
 import { assistantConfig, publicStatus } from "@/lib/assistant/config";
-import { guidedReply, runAssistant, type AssistantReply, type HistoryMessage } from "@/lib/assistant/engine";
+import { guidedReply, readOnlyReply, runAssistant, type AssistantReply, type HistoryMessage } from "@/lib/assistant/engine";
 import { AssistantError } from "@/lib/assistant/provider";
 import { deepFreeze } from "@/lib/assistant/tools";
 
@@ -93,7 +93,10 @@ export async function POST(req: Request) {
     ).map((m) => ({ role: m.role, content: m.content }));
 
     let reply: AssistantReply;
-    if (cfg.connected) {
+    const refusal = readOnlyReply(question, cfg.name);
+    if (refusal) {
+      reply = refusal;
+    } else if (cfg.connected) {
       try {
         reply = await runAssistant({ cfg, owner, data, assumptions, question, history });
       } catch (e) {

@@ -31,8 +31,8 @@ export class AssistantError extends Error {
 // models, for example, reject `max_tokens` and custom `temperature`. When an
 // endpoint reports an unsupported setting, the request is adjusted, retried and
 // the adjustment remembered for that model.
-type Quirks = { completionTokens: boolean; temperature: boolean; reasoning: boolean };
-const DEFAULT_QUIRKS: Quirks = { completionTokens: false, temperature: true, reasoning: true };
+type Quirks = { completionTokens: boolean; temperature: boolean; reasoning: boolean; required: boolean };
+const DEFAULT_QUIRKS: Quirks = { completionTokens: false, temperature: true, reasoning: true, required: true };
 const learned = new Map<string, Quirks>();
 
 async function unsupportedParam(response: Response): Promise<string | null> {
@@ -42,7 +42,7 @@ async function unsupportedParam(response: Response): Promise<string | null> {
     if (!e) return null;
     if (typeof e.param === "string" && /unsupported/.test(String(e.code ?? e.message))) return e.param;
     const m = String(e.message ?? "");
-    for (const p of ["max_tokens", "temperature", "reasoning_effort"]) if (m.includes(`'${p}'`) && /unsupported|not supported/i.test(m)) return p;
+    for (const p of ["max_tokens", "temperature", "reasoning_effort", "tool_choice"]) if (m.includes(`'${p}'`) && /unsupported|not supported/i.test(m)) return p;
   } catch {
     /* not JSON */
   }
@@ -54,6 +54,7 @@ export async function complete(
   owner: string,
   messages: ChatMessage[],
   tools?: readonly unknown[],
+  options: { forceTool?: boolean } = {},
 ): Promise<Completion> {
   const id = crypto.randomUUID();
   const started = Date.now();
@@ -79,7 +80,7 @@ export async function complete(
           ...(quirks.completionTokens ? { max_completion_tokens: cfg.maxTokens } : { max_tokens: cfg.maxTokens }),
           ...(cfg.reasoningEffort && quirks.reasoning ? { reasoning_effort: cfg.reasoningEffort } : {}),
           // Only widely supported fields, so the same request works on hosted and self-hosted servers.
-          ...(tools ? { tools, tool_choice: "auto" } : {}),
+          ...(tools ? { tools, tool_choice: options.forceTool && quirks.required ? "required" : "auto" } : {}),
         }),
       });
     } catch {
@@ -91,6 +92,7 @@ export async function complete(
     if (param === "max_tokens" && !quirks.completionTokens) quirks.completionTokens = true;
     else if (param === "temperature" && quirks.temperature) quirks.temperature = false;
     else if (param === "reasoning_effort" && quirks.reasoning) quirks.reasoning = false;
+    else if (param === "tool_choice" && quirks.required && options.forceTool) quirks.required = false;
     else break;
     learned.set(key, quirks);
   }

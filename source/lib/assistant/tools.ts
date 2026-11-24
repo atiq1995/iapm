@@ -9,13 +9,24 @@
 //      the same code the dashboards use.
 
 import { answerQuery, intents, validatePlan, type QueryPlan } from "@/lib/reliability-agent";
-import { approved, sum, type Assumptions, type Asset, type Dataset, type Incident } from "@/lib/domain";
+import { aggregate, approved, sum, type Assumptions, type Asset, type Dataset, type Incident } from "@/lib/domain";
 import { assetMTBF } from "@/lib/mtbf";
 
 export type Source = { id: string; label: string; assetId: string; incidentId?: string };
 export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string };
 
-export const TOOL_NAMES = ["query_reliability", "search_incidents", "get_asset_profile"] as const;
+export const TOOL_NAMES = ["rank_assets", "query_reliability", "search_incidents", "get_asset_profile"] as const;
+
+// rank_assets metric → field produced by the Bad actors aggregate (same numbers as that screen).
+const RANK_METRICS = {
+  actual_loss: { field: "loss", label: "Actual loss (approved F1) · USD" },
+  potential_loss: { field: "potential", label: "Potential exposure (F2 estimate) · USD" },
+  downtime: { field: "days", label: "Actual downtime (F1) · days" },
+  potential_downtime: { field: "potentialDays", label: "Potential downtime (F2 estimate) · days" },
+  maintenance: { field: "maintenance", label: "Maintenance cost · USD" },
+  events: { field: "events", label: "Approved F1 loss events" },
+} as const;
+type RankMetric = keyof typeof RANK_METRICS;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
 const QUERY_INTENTS: string[] = intents.filter((i) => i !== "help");
@@ -25,6 +36,26 @@ const STOP_WORDS = new Set(
 );
 
 export const TOOL_SPECS = [
+  {
+    type: "function",
+    function: {
+      name: "rank_assets",
+      description:
+        "Rank ALL assets (no asset tag needed) by a metric. Use first for any 'top', 'worst', 'highest', 'biggest', 'loss driver' or 'bad actor' question. Metrics: actual_loss (approved F1 USD), potential_loss (estimated F2 exposure USD; never add to actual), downtime, potential_downtime, maintenance (USD), events (F1 count). Optional site, category and years.",
+      parameters: {
+        type: "object",
+        properties: {
+          metric: { type: "string", enum: Object.keys(RANK_METRICS) },
+          site: { type: "string", description: "Site name, or empty for all sites." },
+          category: { type: "string", description: "Equipment, Machinery, Instrumentation or Electrical; empty for all." },
+          from: { type: "integer", description: "First incident year, default 1990." },
+          to: { type: "integer", description: "Last incident year, default 2026." },
+          limit: { type: "integer", description: "Rows to return, 1-20, default 10." },
+        },
+        required: ["metric"],
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -158,13 +189,59 @@ function queryReliability(d: Dataset, args: Record<string, unknown>, assumptions
       title: r.title,
       result: r.answer,
       basis: r.basis,
-      columns: r.columns,
-      rows: r.rows.slice(0, 20).map((row) => row.values),
+      // Each row carries its record ID so the model never has to guess IDs from tags.
+      columns: ["ID", ...r.columns],
+      rows: r.rows.slice(0, 20).map((row) => [row.incidentId || row.assetId || "", ...row.values]),
       supportingRecords: r.sourceCount,
       citableIds: r.sources.slice(0, 40).map((s) => s.id),
     },
     r.sources,
     scope,
+  );
+}
+
+function rankAssets(d: Dataset, args: Record<string, unknown>): ToolOutcome {
+  const metric = text(args.metric, 30) as RankMetric;
+  if (!(metric in RANK_METRICS)) throw new ToolInputError(`Unsupported metric. Use one of: ${Object.keys(RANK_METRICS).join(", ")}.`);
+  const site = resolveOption([...new Set(d.assets.map((a) => a.site))], args.site, "site");
+  const category = resolveOption([...new Set(d.assets.map((a) => a.category))], args.category, "category");
+  const { from, to } = years(args);
+  const limit = int(args.limit, 10, 1, 20);
+  const ids = new Set(d.assets.filter((a) => (!site || a.site === site) && (!category || a.category === category)).map((a) => a.id));
+  const rows = d.incidents.filter((e) => ids.has(e.assetId) && +e.date.slice(0, 4) >= from && +e.date.slice(0, 4) <= to);
+  const { field, label } = RANK_METRICS[metric];
+  const value = (r: Record<string, unknown>) => Number(r[field]) || 0;
+  const ranked = aggregate(d, rows)
+    .filter((r) => ids.has(r.id))
+    .sort((a, b) => value(b) - value(a));
+  const total = sum(ranked.map(value));
+  const top = ranked.slice(0, limit);
+  const round = (n: number) => (metric.includes("downtime") ? Math.round(n * 10) / 10 : Math.round(n));
+  return finish(
+    {
+      metric: label,
+      scope: { site: site || "all sites", category: category || "all categories", from, to, assetsRanked: ranked.length },
+      portfolioTotal: round(total),
+      ranking: top.map((r, i) => ({
+        rank: i + 1,
+        id: r.id,
+        tag: r.tag,
+        site: r.site,
+        category: r.category,
+        value: round(value(r)),
+        shareOfTotalPct: total ? Math.round((value(r) / total) * 1000) / 10 : 0,
+        actualLossUSD: Math.round(r.loss),
+        potentialExposureUSD: Math.round(r.potential),
+        f1Events: r.events,
+        f2Records: r.secondary,
+      })),
+      notes: [
+        "Uses approved/closed records only, the same calculation as the Bad actors screen.",
+        "Potential exposure is an estimate: average loss of earlier matching F1 events (same failure mode, category and service) × 1.3 uncertainty. It is never added to actual loss.",
+      ],
+    },
+    top.map((r) => ({ id: r.id, label: `${r.tag} · ${r.site}`, assetId: r.id })),
+    `rank ${metric}${site ? " · " + site : ""}${category ? " · " + category : ""} · ${from}–${to}`,
   );
 }
 
@@ -265,6 +342,7 @@ export function runTool(name: string, rawArgs: unknown, d: Dataset, assumptions:
     return { ok: false, content: JSON.stringify({ error: "Arguments were not valid JSON." }), sources: [], summary: `${name} · invalid arguments` };
   }
   try {
+    if (name === "rank_assets") return rankAssets(d, args);
     if (name === "query_reliability") return queryReliability(d, args, assumptions);
     if (name === "search_incidents") return searchIncidents(d, args);
     if (name === "get_asset_profile") return assetProfile(d, args);
