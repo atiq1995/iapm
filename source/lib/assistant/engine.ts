@@ -3,10 +3,10 @@
 // not exist in the database.
 
 import { answerQuery, emptyPlan, parseQuestion } from "@/lib/reliability-agent";
-import type { Assumptions, Dataset } from "@/lib/domain";
+import { defaultAssumptions, type Assumptions, type Dataset } from "@/lib/domain";
 import type { AssistantConfig } from "./config";
 import { AssistantError, complete, type ChatMessage, type ToolCall } from "./provider";
-import { TOOL_NAMES, TOOL_SPECS, runTool, type Source } from "./tools";
+import { TOOL_NAMES, TOOL_SPECS, runTool, type Source, type TrendChart } from "./tools";
 
 export type Step = { tool: string; summary: string; ok: boolean };
 export type HistoryMessage = { role: "user" | "assistant"; content: string };
@@ -18,6 +18,7 @@ export type AssistantReply = {
   engine: "model" | "guided";
   model?: string;
   notice?: string;
+  charts?: TrendChart[];
 };
 
 const MAX_ROUNDS = 6;
@@ -144,6 +145,63 @@ export function verifyCitations(answer: string, sources: Source[], d: Dataset) {
   return { sources: ordered.slice(0, 100), warnings };
 }
 
+const TREND_WORDS = /\b(trend\w*|plot\w*|chart\w*|graph\w*|over time|per year|by year|yearly|annual(?:ly)?|per month|by month|monthly|over the years|year[- ]on[- ]year)\b/;
+
+// "Plot the failure trend for SC-E-101 since 2010" → trend_over_time arguments.
+export function trendRequest(question: string, d: Dataset, assetId: string, site: string, category: string) {
+  const q = question.toLowerCase();
+  if (!TREND_WORDS.test(q)) return null;
+  const metric = /potential|exposure|\bf2\b/.test(q)
+    ? "potential_loss"
+    : /downtime|outage/.test(q)
+      ? "downtime"
+      : /maintenance/.test(q)
+        ? "maintenance"
+        : /\bloss|cost of failure|business impact|\busd\b|\$/.test(q)
+          ? "actual_loss"
+          : /\b(rir|record|report|incident)s?\b/.test(q) && !/fail/.test(q)
+            ? "records"
+            : "failures";
+  const ys = (q.match(/\b(?:19|20)\d{2}\b/g) || []).map(Number);
+  let from = 1990, to = 2026;
+  const lastN = q.match(/\b(?:last|past)\s+(\d{1,2})\s+years?\b/);
+  if (lastN) from = 2026 - Number(lastN[1]) + 1;
+  else if (ys.length >= 2) {
+    from = Math.min(...ys);
+    to = Math.max(...ys);
+  } else if (ys.length === 1) {
+    if (/\b(since|after|from)\b/.test(q)) from = ys[0];
+    else if (/\b(before|until|till|up to)\b/.test(q)) to = ys[0];
+    else from = to = ys[0];
+  }
+  const mode = [...new Set(d.incidents.map((e) => e.mode))].find((m) => q.includes(m.toLowerCase())) || "";
+  return {
+    name: "trend_over_time",
+    args: { metric, asset: assetId, site, category, failure_mode: mode, from, to, ...(/\bmonth/.test(q) ? { interval: "month" } : {}) },
+  };
+}
+
+const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+
+// Chart answer built without the model (no model attached, or the model failed).
+function trendReply(data: Dataset, question: string, notice?: string): AssistantReply | null {
+  if (WRITE_INTENT.test(question)) return null;
+  const plan = parseQuestion(question, data, { ...emptyPlan, from: 1990, to: 2026 });
+  const req = trendRequest(question, data, plan.assetId, plan.site, plan.category);
+  if (!req) return null;
+  const out = runTool(req.name, req.args, data, defaultAssumptions);
+  if (!out.ok || !out.chart) return null;
+  const j = JSON.parse(out.content);
+  const unit = out.chart.unit === "USD" ? " USD" : ` ${out.chart.unit}`;
+  const change = j.changeFirstToLastThirdPct;
+  const lines = [
+    `**${out.chart.title}**`,
+    `Total ${fmt(j.total)}${unit} over ${j.periods} ${out.chart.interval}s.${j.peak ? ` Peak: ${fmt(j.peak.value)}${unit} in ${j.peak.period}.` : ""}`,
+    change === null ? "" : `The average ${change >= 0 ? "rose" : "fell"} ${Math.abs(change)}% from the first third of the period to the last third.`,
+  ];
+  return { answer: lines.filter(Boolean).join("\n\n"), sources: out.sources, steps: [{ tool: req.name, summary: out.summary, ok: true }], warnings: [], engine: "guided", notice, charts: [out.chart] };
+}
+
 // Maps common questions to a query to run before the model is called.
 export function preRetrieve(question: string, d: Dataset): { name: string; args: Record<string, unknown> } | null {
   if (WRITE_INTENT.test(question)) return null;
@@ -152,6 +210,8 @@ export function preRetrieve(question: string, d: Dataset): { name: string; args:
   // Short answers: 5 rows unless the user asked for a number ("top 10").
   const limit = /\b(?:top|first|bottom)\s+\d+/.test(q) ? Math.min(plan.limit, 20) : 5;
   const scope = { site: plan.site, category: plan.category, from: plan.from, to: plan.to, limit };
+  const trend = trendRequest(question, d, plan.assetId, plan.site, plan.category);
+  if (trend) return trend;
   if (/\b(potential|exposure|f2)\b/.test(q) && !plan.assetId)
     return { name: "rank_assets", args: { metric: /downtime/.test(q) ? "potential_downtime" : "potential_loss", ...scope } };
   if (plan.intent === "help" && !plan.assetId && /\b(focus|priorit\w*|start with|most important|biggest (?:problem|issue|risk)|attention|where should)\b/.test(q))
@@ -186,8 +246,30 @@ export function readOnlyReply(question: string, name: string): AssistantReply | 
   };
 }
 
+// Numbers above 100 in the answer must match a number in the data retrieved for it.
+// Abbreviated figures ($974M) are compared with a rounding tolerance; plain years are skipped.
+export function unmatchedFigures(answer: string, known: number[]) {
+  const text = answer.replace(ID_PATTERN, " ").replace(/\b[A-Z]{2}-[A-Z]{1,2}-\d{3}\b/gi, " ");
+  const found: string[] = [];
+  for (const m of text.matchAll(/(\d[\d,]*(?:\.\d+)?)\s*(thousand|million|billion|bn|k|m|b)?\b/gi)) {
+    const raw = m[1].replace(/,/g, "");
+    const suffix = (m[2] || "").toLowerCase();
+    const mult = suffix === "k" || suffix === "thousand" ? 1e3 : suffix === "m" || suffix === "million" ? 1e6 : suffix ? 1e9 : 1;
+    const value = Number(raw) * mult;
+    if (!Number.isFinite(value) || value < 100) continue;
+    if (mult === 1 && /^\d{4}$/.test(raw) && value >= 1900 && value <= 2100) continue;
+    const tolerance = mult > 1 ? 0.06 : 0.005;
+    if (!known.some((k) => Math.abs(k - value) <= Math.max(1, Math.abs(k) * tolerance))) found.push(m[0].trim());
+  }
+  return [...new Set(found)].slice(0, 5);
+}
+
+const numbersIn = (text: string) =>
+  [...text.matchAll(/-?\d[\d,]*(?:\.\d+)?/g)].map((m) => Number(m[0].replace(/,/g, ""))).filter(Number.isFinite);
+
 const TOOL_WORDS: Record<string, string> = {
   rank_assets: "the asset ranking",
+  trend_over_time: "the trend chart",
   query_reliability: "the reliability query",
   search_incidents: "the incident search",
   get_asset_profile: "the asset profile",
@@ -206,6 +288,15 @@ export function polishAnswer(answer: string, d: Dataset) {
     const real = byTag.get(String(tag).toUpperCase());
     return real && real !== id ? `${real}${open}${tag}${close}` : all;
   });
+  // Drop pseudo-citations such as "[trend_over_time result]" or "[latest]"; only record IDs
+  // (which start with capitals, e.g. [RIR-04609]) are cited.
+  text = text.replace(/\s*\[[a-z][a-z _-]{0,40}\]/g, "");
+  // Drop echoes of internal instructions ("(from display)", "Values copied exactly from display").
+  text = text.replace(/\s*\((?:from|per|based on) (?:the )?(?:display|ranking|tool|results?)\)/gi, "");
+  text = text
+    .split("\n")
+    .filter((line) => !/\b(copied exactly|from display|no reformatting|tool results?)\b/i.test(line))
+    .join("\n");
   // Plain wording instead of internal tool names.
   for (const [tool, words] of Object.entries(TOOL_WORDS)) text = text.split(tool).join(words);
   return text;
@@ -253,6 +344,8 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
     { role: "user", content: question + (hints.length ? `\n\n[Context: assets mentioned: ${hints.join("; ")}]` : "") },
   ];
   const steps: Step[] = [];
+  const charts: TrendChart[] = [];
+  const known: number[] = [];
   const sources = new Map<string, Source>();
   let answer = "";
   let calls = 0;
@@ -278,6 +371,8 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
       const last = messages[messages.length - 1];
       if (last.role === "user") last.content += `\n\n[Context: data for this question was retrieved below (${outcome.summary}). Answer from it, not from earlier answers.]`;
       for (const s of outcome.sources) sources.set(s.id, s);
+      if ("chart" in outcome && outcome.chart) charts.push(outcome.chart);
+      known.push(...numbersIn(outcome.content));
       if (jsonMode) {
         messages.push({ role: "assistant", content: JSON.stringify({ tool: pre.name, arguments: pre.args }) });
         messages.push({ role: "user", content: `TOOL RESULT (${pre.name}): ${outcome.content}\n\nUse these results. Reply with another tool call JSON or {"answer": "..."}.` });
@@ -338,6 +433,8 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
           : runTool(call.function.name, call.function.arguments, data, assumptions);
       steps.push({ tool: call.function.name, summary: outcome.summary, ok: outcome.ok });
       for (const s of outcome.sources) sources.set(s.id, s);
+      if ("chart" in outcome && outcome.chart) charts.push(outcome.chart);
+      known.push(...numbersIn(outcome.content));
       if (viaText) results.push(`TOOL RESULT (${call.function.name}): ${outcome.content}`);
       else messages.push({ role: "tool", tool_call_id: call.id, content: outcome.content });
     }
@@ -362,8 +459,10 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
 
   const checked = verifyCitations(answer, [...sources.values()], data);
   const warnings = [...checked.warnings];
+  const unmatched = steps.length ? unmatchedFigures(answer, known) : [];
+  if (unmatched.length) warnings.push(`These figures do not match the data retrieved for this answer: ${unmatched.join(", ")}. Check them against the chart or the source records.`);
   if (!steps.length && /\d/.test(answer)) warnings.push("No database tool was used for this answer. Treat any figures as general guidance, not plant data.");
-  return { answer, sources: checked.sources, steps, warnings, engine: "model", model };
+  return { answer, sources: checked.sources, steps, warnings, engine: "model", model, charts: charts.slice(-2) };
 }
 
 export async function runAssistant(input: RunInput): Promise<AssistantReply> {
@@ -381,6 +480,8 @@ export async function runAssistant(input: RunInput): Promise<AssistantReply> {
 const cell = (v: string) => v.replace(/\|/g, "/").replace(/\n/g, " ");
 
 export function guidedReply(data: Dataset, question: string, assumptions: Assumptions, notice?: string): AssistantReply {
+  const trend = trendReply(data, question, notice);
+  if (trend) return trend;
   const plan = parseQuestion(question, data, { ...emptyPlan, from: 1990, to: 2026 });
   const r = answerQuery(data, plan, assumptions);
   const parts = [`**${r.title}**`, r.answer];

@@ -39,7 +39,8 @@ const inFlight = new Set<string>();
 function rateLimited(owner: string) {
   const now = Date.now();
   const list = (recent.get(owner) || []).filter((t) => now - t < 60000);
-  if (list.length >= 15) return true;
+  const limit = Math.min(1000, Math.max(1, Number(process.env.AI_RATE_PER_MINUTE) || 15));
+  if (list.length >= limit) return true;
   list.push(now);
   recent.set(owner, list);
   return false;
@@ -120,6 +121,7 @@ export async function POST(req: Request) {
           role: "assistant",
           content: reply.answer,
           sources: reply.sources.slice(0, 40),
+          charts: reply.charts?.slice(0, 2),
           steps: reply.steps,
           warnings: reply.warnings,
           engine: reply.engine,

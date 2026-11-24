@@ -11,11 +11,34 @@
 import { answerQuery, intents, validatePlan, type QueryPlan } from "@/lib/reliability-agent";
 import { aggregate, approved, sum, type Assumptions, type Asset, type Dataset, type Incident } from "@/lib/domain";
 import { assetMTBF } from "@/lib/mtbf";
+import { factsFor, METRICS as CHART_METRICS } from "@/lib/visual-analytics";
 
 export type Source = { id: string; label: string; assetId: string; incidentId?: string };
-export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string };
+// Chart data goes straight to the browser; the model only receives a compact summary.
+export type TrendChart = {
+  kind: "trend";
+  title: string;
+  metric: string;
+  unit: string;
+  interval: "year" | "month";
+  points: { period: string; value: number }[];
+  filters: { site: string; category: string; asset: string; mode: string; from: number; to: number };
+};
+export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string; chart?: TrendChart };
 
-export const TOOL_NAMES = ["rank_assets", "query_reliability", "search_incidents", "get_asset_profile"] as const;
+export const TOOL_NAMES = ["rank_assets", "trend_over_time", "query_reliability", "search_incidents", "get_asset_profile"] as const;
+
+// trend_over_time metric → Executive overview chart-studio metric (same definitions and numbers).
+const TREND_METRICS = {
+  failures: "events",
+  actual_loss: "loss",
+  downtime: "days",
+  potential_loss: "exposure",
+  records: "records",
+  maintenance: "maintenance",
+} as const;
+type TrendMetric = keyof typeof TREND_METRICS;
+const DATA_END_YEAR = 2026;
 
 // rank_assets metric → field produced by the Bad actors aggregate (same numbers as that screen).
 const RANK_METRICS = {
@@ -51,6 +74,28 @@ export const TOOL_SPECS = [
           from: { type: "integer", description: "First incident year, default 1990." },
           to: { type: "integer", description: "Last incident year, default 2026." },
           limit: { type: "integer", description: "Rows to return, 1-20, default 10." },
+        },
+        required: ["metric"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "trend_over_time",
+      description:
+        "Trend over time, per year (or per month for spans up to 3 years). Use for any 'trend', 'plot', 'chart', 'graph', 'over time', 'per year' or 'history over the years' question. The user automatically sees a chart of every point; you receive a summary. Metrics: failures (downtime events from approved F1 records), actual_loss (USD), downtime (asset-days), potential_loss (F2 exposure USD), records (approved RIRs), maintenance (USD).",
+      parameters: {
+        type: "object",
+        properties: {
+          metric: { type: "string", enum: Object.keys(TREND_METRICS) },
+          asset: { type: "string", description: "Optional asset tag such as SC-E-101, or asset ID." },
+          site: { type: "string", description: "Site name, or empty for all sites." },
+          category: { type: "string", description: "Equipment, Machinery, Instrumentation or Electrical; empty for all." },
+          failure_mode: { type: "string", description: "Optional failure mode, e.g. Seal leakage." },
+          from: { type: "integer", description: "First year, default 1990." },
+          to: { type: "integer", description: "Last year, default 2026." },
+          interval: { type: "string", enum: ["year", "month"], description: "Default: year (month only for spans up to 3 years)." },
         },
         required: ["metric"],
       },
@@ -245,6 +290,103 @@ function rankAssets(d: Dataset, args: Record<string, unknown>): ToolOutcome {
   );
 }
 
+function trendOverTime(d: Dataset, args: Record<string, unknown>): ToolOutcome {
+  const metric = text(args.metric, 30) as TrendMetric;
+  if (!(metric in TREND_METRICS)) throw new ToolInputError(`Unsupported metric. Use one of: ${Object.keys(TREND_METRICS).join(", ")}.`);
+  const asset = resolveAsset(d, args.asset ?? args.assetId);
+  const site = resolveOption([...new Set(d.assets.map((a) => a.site))], args.site, "site");
+  const category = resolveOption([...new Set(d.assets.map((a) => a.category))], args.category, "category");
+  const mode = resolveOption([...new Set(d.incidents.map((e) => e.mode))], args.failure_mode ?? args.mode, "failure mode");
+  const range = years({ from: args.from, to: args.to ?? DATA_END_YEAR });
+  // History ends in 2026; future years would only add empty bars.
+  const from = range.from, to = Math.min(range.to, DATA_END_YEAR);
+  if (from > to) throw new ToolInputError(`Recorded history ends in ${DATA_END_YEAR}. Choose years up to ${DATA_END_YEAR}.`);
+  const span = to - from + 1;
+  const interval: "year" | "month" = span <= 3 && (args.interval === "month" || (span <= 2 && args.interval !== "year")) ? "month" : "year";
+
+  const assets = new Map(d.assets.map((a) => [a.id, a]));
+  const rows = d.incidents.filter((e) => {
+    const a = assets.get(e.assetId);
+    const y = +e.date.slice(0, 4);
+    return !!a && y >= from && y <= to && (!asset || a.id === asset.id) && (!site || a.site === site) && (!category || a.category === category) && (!mode || e.mode === mode);
+  });
+  const field = TREND_METRICS[metric];
+  const meta = CHART_METRICS[field];
+  const dates = new Map(rows.map((e) => [e.id, e.date]));
+  const totals = new Map<string, number>();
+  for (const f of factsFor(d, rows)) {
+    const key = interval === "year" ? String(f.year) : (dates.get(f.id) || "").slice(0, 7);
+    totals.set(key, (totals.get(key) || 0) + f[field]);
+  }
+  // Every period appears, including zeros, up to the current month.
+  const now = new Date().toISOString().slice(0, 7);
+  const periods: string[] = [];
+  for (let y = from; y <= to; y++) {
+    if (interval === "year") periods.push(String(y));
+    else for (let m = 1; m <= 12; m++) {
+      const p = `${y}-${String(m).padStart(2, "0")}`;
+      if (p <= now) periods.push(p);
+    }
+  }
+  const round = (n: number) => (meta.unit === "USD" ? Math.round(n) : Math.round(n * 10) / 10);
+  const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+  const show = (n: number) => {
+    const v = round(n);
+    const exact = `${v.toLocaleString("en-US", { maximumFractionDigits: 1 })} ${meta.unit}`;
+    return Math.abs(v) >= 1e6 ? `${exact} (≈ ${compact.format(v)})` : exact;
+  };
+  const points = periods.map((period) => ({ period, value: round(totals.get(period) || 0) }));
+  const values = points.map((p) => p.value);
+  const total = round(sum(values));
+  const peak = points.reduce((a, b) => (b.value > a.value ? b : a), points[0]);
+  const third = Math.max(1, Math.floor(points.length / 3));
+  const avg = (xs: number[]) => (xs.length ? sum(xs) / xs.length : 0);
+  const early = avg(values.slice(0, third)), late = avg(values.slice(-third));
+  const scope = [asset ? asset.tag : site || "all sites", !asset && category ? category : "", mode].filter(Boolean).join(" · ");
+  const chart: TrendChart = {
+    kind: "trend",
+    title: `${meta.label} per ${interval} · ${scope} · ${from}–${to}`,
+    metric: meta.label,
+    unit: meta.unit,
+    interval,
+    points,
+    filters: { site, category, asset: asset?.id ?? "", mode, from, to },
+  };
+  return {
+    ...finish(
+      {
+        metric: `${meta.label} (${meta.unit})`,
+        interval,
+        scope: { asset: asset?.tag ?? "all assets", site: site || "all sites", category: category || "all categories", failureMode: mode || "all modes", from, to },
+        periods: points.length,
+        total,
+        averagePerPeriod: round(avg(values)),
+        peak: peak ? { period: peak.period, value: peak.value } : null,
+        periodsWithZero: values.filter((v) => v === 0).length,
+        firstThirdAverage: round(early),
+        lastThirdAverage: round(late),
+        changeFirstToLastThirdPct: early > 0 ? Math.round(((late - early) / early) * 100) : null,
+        latest: points.slice(-3),
+        // Pre-formatted figures for the answer text, so long numbers are copied, not retyped.
+        display: {
+          total: show(total),
+          averagePerPeriod: show(avg(values)),
+          peak: peak ? `${show(peak.value)} in ${peak.period}` : "none",
+          latest: points.slice(-3).map((p) => `${p.period}: ${show(p.value)}`).join("; "),
+        },
+        notes: [
+          "Copy figures exactly from `display`. Do not add, multiply or reformat numbers yourself.",
+          "The user already sees a chart with every point. Summarize the direction, peak and latest values; do not list every period.",
+          "Uses approved records only, the same definitions as the Executive overview chart studio.",
+        ],
+      },
+      asset ? [{ id: asset.id, label: `${asset.tag} · asset register`, assetId: asset.id }] : [],
+      `trend ${metric} · ${scope} · ${from}–${to} · per ${interval}`,
+    ),
+    chart,
+  };
+}
+
 function searchIncidents(d: Dataset, args: Record<string, unknown>): ToolOutcome {
   const asset = resolveAsset(d, args.asset ?? args.assetId);
   const { from, to } = years(args);
@@ -343,6 +485,7 @@ export function runTool(name: string, rawArgs: unknown, d: Dataset, assumptions:
   }
   try {
     if (name === "rank_assets") return rankAssets(d, args);
+    if (name === "trend_over_time") return trendOverTime(d, args);
     if (name === "query_reliability") return queryReliability(d, args, assumptions);
     if (name === "search_incidents") return searchIncidents(d, args);
     if (name === "get_asset_profile") return assetProfile(d, args);

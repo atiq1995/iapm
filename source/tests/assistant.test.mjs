@@ -72,6 +72,7 @@ function mockModel(replies) {
   return requests;
 }
 clearModelEnv();
+process.env.AI_RATE_PER_MINUTE = '1000'; // this suite sends many questions in seconds; the limit itself is tested at the end
 
 await check('Config: defaults to guided engine with the assistant name', () => {
   const c = assistantConfig({});
@@ -151,7 +152,7 @@ await check('Model tool loop: read-only tools, rejected write tool, verified cit
   assert.equal(requests.length, 3);
   assert.equal(requests[0].url, 'https://model.test/v1/chat/completions');
   assert.equal(requests[0].body.model, 'relia-core-8b');
-  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['rank_assets', 'query_reliability', 'search_incidents', 'get_asset_profile']);
+  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['rank_assets', 'trend_over_time', 'query_reliability', 'search_incidents', 'get_asset_profile']);
   assert.ok(!('Authorization' in requests[0].headers), 'no key configured, so no auth header');
   assert.match(requests[0].body.messages.find((x) => x.role === 'user').content, /SC-E-101 = AST-1/);
   assert.equal(requests[0].body.messages.at(-1).role, 'tool', 'data retrieved before the first model call');
@@ -326,6 +327,8 @@ await check('Wrong tag/ID pairs written by the model are corrected; tool names a
   const tag2 = data.assets.find((a) => a.id === 'AST-2').tag;
   const out = polishAnswer('SC-E-101 [AST-7] and AST-9 (SC-E-101) and ' + tag2 + ' [AST-2]. Source: rank_assets.', data);
   assert.equal(out, `SC-E-101 [AST-1] and AST-1 (SC-E-101) and ${tag2} [AST-2]. Source: the asset ranking.`);
+  const echo = polishAnswer('Key figures (from display):\n- Peak: 104 in 2023 [trend_over_time result]\n- 2026: 95 [latest] [RIR-04609]\nNotes:\n- Values copied exactly from display; no reformatting.', data);
+  assert.equal(echo, 'Key figures:\n- Peak: 104 in 2023\n- 2026: 95 [RIR-04609]\nNotes:');
 });
 
 await check('rank_assets matches the Bad actors calculation and rejects bad input', () => {
@@ -337,6 +340,67 @@ await check('rank_assets matches the Bad actors calculation and rejects bad inpu
   assert.ok(j.ranking.every((x) => x.site === 'Safa Coast'));
   assert.equal(r.sources.length, 5);
   assert.equal(runTool('rank_assets', { metric: 'profit' }, data, defaultAssumptions).ok, false);
+});
+
+await check('Trend tool: same numbers as the Executive overview chart engine; monthly for short spans; history clamp', async () => {
+  const { factsFor, groupFacts } = await load('visual-analytics.mjs');
+  const data = deepFreeze(JSON.parse(baseline));
+  const t = runTool('trend_over_time', { metric: 'failures', site: 'Safa Coast', from: 2000, to: 2026 }, data, defaultAssumptions);
+  assert.equal(t.ok, true, t.content);
+  const rows = data.incidents.filter((e) => data.assets.find((a) => a.id === e.assetId).site === 'Safa Coast' && +e.date.slice(0, 4) >= 2000);
+  const expected = Object.fromEntries(groupFacts(factsFor(data, rows), 'year').map((g) => [g.name, g.events]));
+  assert.equal(t.chart.points.length, 27);
+  for (const p of t.chart.points) assert.equal(p.value, expected[p.period] || 0, `year ${p.period}`);
+  assert.ok(!t.content.includes('"points"'), 'model gets a summary, not the full series');
+  assert.ok(t.content.length < 1500);
+  const monthly = runTool('trend_over_time', { metric: 'actual_loss', asset: 'SC-E-101', from: 2024, to: 2025 }, data, defaultAssumptions);
+  assert.equal(monthly.chart.interval, 'month');
+  assert.equal(monthly.chart.points.length, 24);
+  assert.equal(monthly.chart.filters.asset, 'AST-1');
+  const clamped = runTool('trend_over_time', { metric: 'downtime', from: 2020, to: 2040 }, data, defaultAssumptions);
+  assert.equal(clamped.chart.points.at(-1).period, '2026');
+  assert.equal(runTool('trend_over_time', { metric: 'failures', from: 2030, to: 2040 }, data, defaultAssumptions).ok, false);
+});
+
+await check('"Plot the failure trend for SC-E-101 since 2010": data fetched first, chart saved with the answer', async () => {
+  const requests = mockModel([{ content: 'SC-E-101 [AST-1] failures stayed steady since 2010, peaking recently.' }]);
+  const { status, body } = await json(await post({ question: 'Plot the failure trend for SC-E-101 since 2010' }));
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(requests.length, 1);
+  assert.ok(requests[0].body.tools.some((t) => t.function.name === 'trend_over_time'));
+  const tool = JSON.parse(requests[0].body.messages.find((x) => x.role === 'tool').content);
+  assert.equal(tool.scope.asset, 'SC-E-101');
+  assert.equal(tool.scope.from, 2010);
+  const m = body.conversation.messages[1];
+  assert.equal(m.steps[0].tool, 'trend_over_time');
+  assert.equal(m.charts.length, 1);
+  assert.equal(m.charts[0].points[0].period, '2010');
+  assert.equal(m.charts[0].points.at(-1).period, '2026');
+  assert.equal(m.charts[0].filters.asset, 'AST-1');
+});
+
+await check('Figure check: a garbled total (real case: 97,395,033,600 for 973,950,336) is flagged; correct figures pass', async () => {
+  const { unmatchedFigures } = await load('assistant-engine.mjs');
+  const known = [973950336, 26322982, 35596618, 3846.3, 21554713];
+  assert.deepEqual(unmatchedFigures('Total actual loss: 97,395,033,600 USD.', known), ['97,395,033,600']);
+  assert.deepEqual(unmatchedFigures('Total 973,950,336 USD (≈ $974M); peak 35,596,618 in 1990; MTBF 3,846.3 h; $21.6M exposure. SC-E-101 [RIR-04609] 2010–2026, 95 events.', known), []);
+  assert.deepEqual(unmatchedFigures('About $3.2B lost.', known), ['3.2B']);
+  mockModel([{ content: 'Safa Coast actual loss totals 97,395,033,600 USD since 1990.' }]);
+  const { body } = await json(await post({ question: 'Show actual loss per year at Safa Coast' }));
+  const m = body.conversation.messages[1];
+  assert.match(m.warnings.join(' '), /do not match the data retrieved.*97,395,033,600/);
+  assert.equal(m.charts.length, 1, 'the chart itself is still correct and shown');
+});
+
+await check('Trend questions still get a chart when the model is down', async () => {
+  globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+  const { body } = await json(await post({ question: 'Show downtime per year at Wadi North for the last 10 years' }));
+  const m = body.conversation.messages[1];
+  assert.equal(m.engine, 'guided');
+  assert.equal(m.charts.length, 1);
+  assert.equal(m.charts[0].points.length, 10);
+  assert.equal(m.charts[0].filters.site, 'Wadi North');
+  assert.match(m.content, /Total .* asset-days over 10 years/);
 });
 
 await check('Model unreachable → guided answer with a visible notice', async () => {
@@ -372,8 +436,21 @@ await check('Owner isolation: conversations are private to their owner', async (
   assert.equal((await json(await route.GET())).body.conversations.length, 0);
   assert.equal((await post({ question: 'Continue please', conversationId: guidedConversation.id })).status, 404);
   rt.context('owner-token');
-  // 13 conversations: the follow-up question extended an existing one.
-  assert.equal((await json(await route.GET())).body.conversations.length, 13);
+  // 16 conversations: the follow-up question extended an existing one.
+  assert.equal((await json(await route.GET())).body.conversations.length, 16);
+});
+
+await check('Rate limit: questions beyond the per-minute limit are refused with 429', async () => {
+  clearModelEnv();
+  process.env.AI_RATE_PER_MINUTE = '1';
+  rt.sql.prepare('INSERT INTO accounts VALUES(?,?,?,?)').run('limited', 'limited@example.invalid', 'h', 's');
+  rt.sql.prepare('INSERT INTO sessions VALUES(?,?,?)').run(await digest('limited-token'), 'limited', Date.now() + 1e7);
+  rt.context('limited-token');
+  assert.equal((await post({ question: 'Compare actual loss by site' })).status, 200);
+  const blocked = await json(await post({ question: 'Compare actual loss by site' }));
+  assert.equal(blocked.status, 429);
+  assert.match(blocked.body.error, /Too many questions/);
+  delete process.env.AI_RATE_PER_MINUTE;
 });
 
 clearModelEnv();

@@ -18,6 +18,9 @@ Language model  ◄──── tool results (JSON) ────┐
 Read-only tools (lib/assistant/tools.ts) ──────┘
    rank_assets        → portfolio ranking: actual loss, potential (F2) exposure, downtime, maintenance, events
                         (same calculation as the Bad actors screen)
+   trend_over_time    → per-year (or per-month) trend with a chart in the answer; same metric definitions
+                        as the Executive overview chart studio. Chart data goes straight to the browser;
+                        the model only receives a short summary with pre-formatted figures.
    query_reliability  → shared iAPM engine (loss, MTBF, criticality, MEDFI, sites, economics, forecast)
    search_incidents   → keyword search over RIR narratives, causes, actions
    get_asset_profile  → one asset: register, MTBF, loss, stages, failure modes, open actions
@@ -31,6 +34,9 @@ Answer → citation check (every RIR/AST/ACT ID must exist) → saved conversati
 * **Named asset stays pinned.** When the question names one asset, queries the model sends without an asset keep that asset.
 * **Change requests** ("delete…", "approve…") get a fixed read-only reply naming the right iAPM screen, without calling the model.
 * **ID correction.** Every "TAG [AST-n]" pair in an answer is checked against the register and corrected if the model mismatched them.
+* **Figure check.** Every number above 100 in an answer must match a number in the data retrieved for it; otherwise the answer shows an amber warning naming the figure.
+* **Trend charts.** Questions with "trend", "plot", "chart", "per year", "over time" and similar get a chart (bars for event counts, a line for money and days) with an **Open in Executive overview** button that applies the same filters. Charts also work with no model attached.
+* **Rate limit.** `AI_RATE_PER_MINUTE` (default 15) questions per minute per account, per server instance.
 * **Numbers come from the iAPM engine**, never from the model. The model only chooses tools and writes the explanation.
 * **Read-only by construction.** Tools receive a frozen in-memory copy of the data and no database handle. Unknown tool names (for example `delete_asset`) are rejected. The route writes only the owner's conversation history (`assistant_chat`) and the usage ledger (`ai_usage`).
 * **Hallucination check.** Any cited record ID that does not exist is shown in amber as *unverified*, with a warning under the answer. Real IDs become clickable and open the record.
@@ -98,7 +104,7 @@ Check each provider's current documentation for exact model IDs before going liv
 node tests/assistant.test.mjs
 ```
 
-22 checks: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
+27 checks, including trend numbers matching the Executive overview engine, the figure check, charts without a model, and the rate limit. Also covered: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
 
 ## Production notes
 
