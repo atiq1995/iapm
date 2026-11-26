@@ -101,3 +101,8 @@
 .asst-report{min-width:0;width:100%}
 .asst-report>button:first-child{overflow:hidden}
 .asst-report>button:first-child span{min-width:0;flex:1}
+.relia-extractor{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid #c9e3d8;border-radius:7px;background:#edf6f2;margin-bottom:6px}
+.relia-extractor svg{flex:none;color:var(--primary);margin-top:2px}
+.relia-extractor span{display:grid;gap:2px;min-width:0}
+.relia-extractor b{font-size:13px;color:#00684d}
+.relia-extractor small{font-size:11px;color:#526477;line-height:1.5}

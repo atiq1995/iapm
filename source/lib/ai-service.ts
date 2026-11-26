@@ -10,6 +10,12 @@ export const MODELS = [
 
 export const runtime = appRuntime;
 
+/** Model Relia uses to read historical RIR PDFs. Chosen on the server, never by the browser.
+ *  Override with RIR_EXTRACTION_MODEL (must accept PDF input on the Responses API). */
+export function extractionModel() {
+  return (process.env.RIR_EXTRACTION_MODEL || "gpt-6-astra").trim();
+}
+
 export class AIError extends Error {
   constructor(
     message: string,
@@ -43,6 +49,7 @@ export async function modelStatus() {
     return {
       connected: false,
       models: MODELS.map((m) => ({ ...m, available: false })),
+      extraction: { available: false },
       message:
         "OpenAI API connection required. No live tokens have been consumed.",
     };
@@ -57,6 +64,7 @@ export async function modelStatus() {
     return {
       connected: true,
       models: MODELS.map((m) => ({ ...m, available: ids.has(m.id) })),
+      extraction: { available: ids.has(extractionModel()) },
       message:
         "Models verified against the connected API project. Request-specific permissions still apply.",
     };
@@ -64,6 +72,7 @@ export async function modelStatus() {
     return {
       connected: false,
       models: MODELS.map((m) => ({ ...m, available: false })),
+      extraction: { available: false },
       message:
         "Unable to verify the API connection. Check project permissions and billing.",
     };
@@ -80,7 +89,7 @@ export async function aiResponse(
     throw new AIError(
       "Live AI requires the OpenAI API connection. Use the explicitly labeled reference demonstration meanwhile.",
     );
-  if (!MODELS.some((m) => m.id === model))
+  if (!MODELS.some((m) => m.id === model) && model !== extractionModel())
     throw new AIError("Unsupported model selection.", 400);
   const id = crypto.randomUUID(),
     started = Date.now();
