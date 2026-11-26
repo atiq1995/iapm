@@ -3,6 +3,27 @@
 Relia is the conversational assistant on **Overview → Reliability assistant → Chat with Relia**.
 It answers plain-English questions about the owner's reliability data and cannot change anything.
 
+## Accuracy rule
+
+**Every number the user sees comes from the database.**
+
+* **Charts and reports** (any type: pie, donut, bar, horizontal bar, line, area, stacked, clustered, bubble, table, side-by-side comparison) are built by code from a small *recipe* (type, measure, grouping, filters) using the Executive overview chart engine. The headline, key facts, chart and table are all calculated; the AI writes none of it. When the AI is involved, it only chooses the recipe, and anything the question states explicitly (measure, grouping, site, years, chart type) overrides the AI's choice.
+* **Explanations** ("why…", "what happened…") are written by the AI from read-only tool results. Before the user sees them, every line with a figure that does not match the retrieved data, or a record ID that does not exist, is removed; if nothing verifiable remains, the guided engine answers instead.
+* **Data iAPM does not record** (energy, sensor readings, inventory, workforce…) gets a clear "not recorded" answer and the list of what can be shown. Nothing is estimated.
+
+## Order of answering
+
+1. Change request → fixed read-only reply.
+2. Unrecorded data → "not recorded" reply.
+3. Saved report clicked, named in the question, or matching the requested chart → shown directly (no AI).
+4. Chart request in plain English ("donut of downtime by failure mode at Wadi North since 2015", "compare Safa Coast vs Wadi North", "make it a pie") → calculated chart (no AI).
+5. Common questions (losses, potential, MTBF, trends, priorities) → calculated chart (no AI).
+6. Everything else → AI with read-only tools (including `build_chart`), verified as above.
+
+## Saved reports
+
+Any chart can be saved with **Save report** (stored as a recipe, never as numbers, so it always shows current data). Saved reports appear in Relia's sidebar to run, rename or delete. Asking for a chart that a saved report already covers shows that report directly. API: `GET/POST /api/assistant/reports` (`save`, `rename`, `delete`); running a report is `POST /api/assistant` with `{ reportId }`. Reports are per account and stored in Relia's own library (kind `relia_report`); plant data stays read-only.
+
 ## How it works
 
 ```
@@ -16,6 +37,7 @@ Language model  ◄──── tool results (JSON) ────┐
    │  asks for a tool                          │
    ▼                                           │
 Read-only tools (lib/assistant/tools.ts) ──────┘
+   build_chart        → any chart type for any measure × grouping × filters (lib/assistant/charts.ts)
    rank_assets        → portfolio ranking: actual loss, potential (F2) exposure, downtime, maintenance, events
                         (same calculation as the Bad actors screen)
    trend_over_time    → per-year (or per-month) trend with a chart in the answer; same metric definitions
@@ -107,7 +129,7 @@ Check each provider's current documentation for exact model IDs before going liv
 node tests/assistant.test.mjs
 ```
 
-34 checks, including calculated headlines, the "create a table" fix, site comparisons matching Bad actors, follow-ups, trend numbers matching the Executive overview engine, the figure check, charts without a model, and the rate limit. Also covered: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
+42 checks, including every chart type with numbers cross-checked against the Executive overview engine, saved reports (save, show directly, run, rename, delete, privacy), the guard on the AI's chart choice, verified-text stripping, unrecorded-data replies, calculated headlines, the "create a table" fix, site comparisons matching Bad actors, follow-ups, trend numbers matching the Executive overview engine, the figure check, charts without a model, and the rate limit. Also covered: configuration, authentication and same-origin rules, guided fallback, the model tool loop, rejection of write tools, citation verification, OpenAI parameter adaptation, retrieval-first answers, the lazy-answer guard, asset pinning, fixed read-only replies, tag/ID correction, the JSON-protocol fallback for small models, text-written tool calls, unreachable-model fallback, frozen data, no business-record writes, and owner isolation. Model responses are mocked. Run one real question against your chosen model before a demonstration.
 
 ## Production notes
 

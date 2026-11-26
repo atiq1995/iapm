@@ -12,6 +12,7 @@ import { answerQuery, intents, validatePlan, type QueryPlan } from "@/lib/reliab
 import { aggregate, approved, sum, type Assumptions, type Asset, type Dataset, type Incident } from "@/lib/domain";
 import { assetMTBF } from "@/lib/mtbf";
 import { factsFor, METRICS as CHART_METRICS } from "@/lib/visual-analytics";
+import { BUILD_CHART_PARAMETERS, buildChart, ChartError, normalizeSpec, type BuiltChart, type ChartSpec } from "@/lib/assistant/charts";
 
 export type Source = { id: string; label: string; assetId: string; incidentId?: string };
 // Chart data goes straight to the browser; the model only receives a compact summary.
@@ -23,6 +24,7 @@ export type TrendChart = {
   interval: "year" | "month";
   points: { period: string; value: number }[];
   filters: { site: string; category: string; asset: string; mode: string; from: number; to: number };
+  spec?: ChartSpec;
 };
 // Ranking/comparison shown as a horizontal bar chart plus a table.
 export type RankingChart = {
@@ -35,11 +37,12 @@ export type RankingChart = {
   showShare: boolean;
   rows: { label: string; value: number; share: number; id?: string; sub?: string }[];
   filters: { site: string; category: string; asset: string; mode: string; from: number; to: number };
+  spec?: ChartSpec;
 };
-export type AssistantVisual = TrendChart | RankingChart;
+export type AssistantVisual = TrendChart | RankingChart | BuiltChart;
 export type ToolOutcome = { ok: boolean; content: string; sources: Source[]; summary: string; chart?: AssistantVisual };
 
-export const TOOL_NAMES = ["rank_assets", "trend_over_time", "query_reliability", "search_incidents", "get_asset_profile"] as const;
+export const TOOL_NAMES = ["build_chart", "rank_assets", "trend_over_time", "query_reliability", "search_incidents", "get_asset_profile"] as const;
 
 // trend_over_time metric → Executive overview chart-studio metric (same definitions and numbers).
 const TREND_METRICS = {
@@ -72,6 +75,15 @@ const STOP_WORDS = new Set(
 );
 
 export const TOOL_SPECS = [
+  {
+    type: "function",
+    function: {
+      name: "build_chart",
+      description:
+        "Build any chart or report the user asks for: pie, donut, bar, horizontal bar, line, area, stacked, clustered, bubble, table or side-by-side comparison, for any measure, grouping and filters. Numbers, chart, table and headline are calculated by the system and shown to the user. Use this for every chart, graph, plot, report or comparison request.",
+      parameters: BUILD_CHART_PARAMETERS,
+    },
+  },
   {
     type: "function",
     function: {
@@ -172,6 +184,16 @@ export const TOOL_SPECS = [
 ] as const;
 
 export class ToolInputError extends Error {}
+
+// The same chart expressed as a builder recipe (undefined when there is no exact equivalent).
+function equivalentSpec(d: Dataset, raw: Record<string, unknown>): ChartSpec | undefined {
+  if (!raw.metric) return undefined;
+  try {
+    return normalizeSpec(raw, d);
+  } catch {
+    return undefined;
+  }
+}
 
 // Plain-English proportion words, so headlines match the figures ("about a third", not "the majority").
 export function shareWords(pct: number) {
@@ -357,6 +379,7 @@ function rankAssets(d: Dataset, args: Record<string, unknown>): ToolOutcome {
     showShare: true,
     rows: top.slice(0, 10).map((r) => ({ label: r.name, value: round(r.value), share: share(r.value), ...(groupBy === "asset" ? { id: r.key, sub: `${r.site} · ${r.category}` } : { sub: `${r.assets} assets` }) })),
     filters: { site, category, asset: "", mode: "", from, to },
+    spec: equivalentSpec(d, { type: groupBy === "asset" ? "hbar" : "bar", metric: ({ actual_loss: "loss", potential_loss: "exposure", downtime: "days", maintenance: "maintenance", events: "events" } as Record<string, string>)[metric], dimension: groupBy, filters: { site, category, from, to }, limit }),
   };
   return {
     ...finish(
@@ -453,6 +476,7 @@ function trendOverTime(d: Dataset, args: Record<string, unknown>): ToolOutcome {
     interval,
     points,
     filters: { site, category, asset: asset?.id ?? "", mode, from, to },
+    spec: equivalentSpec(d, { type: field === "events" || field === "records" ? "bar" : "line", metric: field, dimension: "year", filters: { asset: asset?.tag ?? "", site, category, mode, from, to } }),
   };
   // Calculated headline: the engine shows this instead of the model's own first sentence.
   const pct = early > 0 ? Math.round(((late - early) / early) * 100) : null;
@@ -600,6 +624,16 @@ export function runTool(name: string, rawArgs: unknown, d: Dataset, assumptions:
     return { ok: false, content: JSON.stringify({ error: "Arguments were not valid JSON." }), sources: [], summary: `${name} · invalid arguments` };
   }
   try {
+    if (name === "build_chart") {
+      const chart = buildChart(d, args);
+      return {
+        ok: true,
+        content: JSON.stringify({ title: chart.title, headline: chart.headline, keyFacts: chart.facts, note: "The chart, table and headline are shown to the user." }),
+        sources: [],
+        summary: `chart · ${chart.type} · ${chart.title}`,
+        chart,
+      };
+    }
     if (name === "rank_assets") return rankAssets(d, args);
     if (name === "trend_over_time") return trendOverTime(d, args);
     if (name === "query_reliability") return queryReliability(d, args, assumptions);
@@ -607,7 +641,7 @@ export function runTool(name: string, rawArgs: unknown, d: Dataset, assumptions:
     if (name === "get_asset_profile") return assetProfile(d, args);
     return { ok: false, content: JSON.stringify({ error: `Tool "${clip(name, 40)}" does not exist. This assistant is read-only and has only: ${TOOL_NAMES.join(", ")}.` }), sources: [], summary: `rejected tool ${clip(name, 40)}` };
   } catch (e) {
-    const message = e instanceof ToolInputError ? e.message : "Invalid query parameters. Use a registered asset, site, category and year range.";
+    const message = e instanceof ToolInputError || e instanceof ChartError ? e.message : "Invalid query parameters. Use a registered asset, site, category and year range.";
     return { ok: false, content: JSON.stringify({ error: message }), sources: [], summary: `${name} · ${message}` };
   }
 }

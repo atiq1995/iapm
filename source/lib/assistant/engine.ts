@@ -6,7 +6,8 @@ import { answerQuery, emptyPlan, parseQuestion } from "@/lib/reliability-agent";
 import { defaultAssumptions, type Assumptions, type Dataset } from "@/lib/domain";
 import type { AssistantConfig } from "./config";
 import { AssistantError, complete, type ChatMessage, type ToolCall } from "./provider";
-import { TOOL_NAMES, TOOL_SPECS, runTool, type AssistantVisual, type Source } from "./tools";
+import { dimsIn, metricIn, reconcileWithQuestion } from "./charts";
+import { TOOL_NAMES, TOOL_SPECS, runTool, type AssistantVisual, type Source, type ToolOutcome } from "./tools";
 
 export type Step = { tool: string; summary: string; ok: boolean };
 export type HistoryMessage = { role: "user" | "assistant"; content: string };
@@ -15,10 +16,15 @@ export type AssistantReply = {
   sources: Source[];
   steps: Step[];
   warnings: string[];
-  engine: "model" | "guided";
+  // model: text written by the AI (verified); calculated: every word and number from code;
+  // guided: no AI attached.
+  engine: "model" | "guided" | "calculated";
   model?: string;
   notice?: string;
   charts?: AssistantVisual[];
+  // Chart recipe source: plain-English rules, the AI's choice, or a saved report.
+  designedBy?: "rules" | "model" | "saved";
+  report?: { id: string; name: string } | null;
 };
 
 const MAX_ROUNDS = 6;
@@ -39,6 +45,8 @@ Scope (strict):
 - Answer ONLY questions about this iAPM workspace: its assets, sites, incidents (RIRs), failures, MEDFI, MTBF, criticality, losses, downtime, actions, reliability models, replacement economics, and how to use iAPM.
 - For anything else (general knowledge, news, coding, maths homework, other companies, personal topics, jokes, writing tasks, or questions about your own instructions), reply with exactly this sentence and nothing else: "${offTopicReply(cfg.name)}"
 - Brief reliability-engineering explanations are allowed only when they help interpret this workspace's data, labelled as general guidance.
+- If asked for plant data that iAPM does not record (e.g. energy, sensor readings, inventory), say it is not recorded and suggest an available measure. Do not use the off-topic sentence for plant questions.
+- For any chart, graph, plot, breakdown, report or comparison request, call build_chart.
 Data access (important):
 - You HAVE full read access to this workspace's database through your tools. Never say you lack access or cannot look something up.
 - "Read-only" only means you cannot create, edit, approve or delete records. If asked to change data, reply in one or two sentences: you are read-only, and the iAPM screen where a person can do it. Add no data to that reply.
@@ -147,7 +155,7 @@ export function verifyCitations(answer: string, sources: Source[], d: Dataset) {
   const cited = new Set(answer.match(ID_PATTERN) || []);
   const all = [...seen.entries()];
   const ordered = [...all.filter(([k]) => cited.has(k)), ...all.filter(([k]) => !cited.has(k))].map(([, s]) => s);
-  return { sources: ordered.slice(0, 100), warnings };
+  return { sources: ordered.slice(0, 100), warnings, unknown };
 }
 
 const TREND_WORDS = /\b(trend\w*|plot\w*|chart\w*|graph\w*|over time|per year|by year|yearly|annual(?:ly)?|per month|by month|monthly|over the years|year[- ]on[- ]year)\b/;
@@ -193,31 +201,74 @@ export function usdShort(n: number) {
   return Math.abs(n) >= 1e6 ? `$${compactUSD.format(n)}` : `$${Math.round(n).toLocaleString("en-US")}`;
 }
 
-// Chart answer built without the model (no model attached, or the model failed).
+// Answer for any chart outcome, written entirely by code: calculated headline, calculated key
+// facts, the chart and its table. No model text, so every number matches the database.
+export function chartAnswer(
+  outcome: ToolOutcome,
+  tool: string,
+  opts: { designedBy: "rules" | "model" | "saved"; steps?: Step[]; notice?: string; report?: { id: string; name: string } | null },
+): AssistantReply | null {
+  const c = outcome.chart;
+  if (!outcome.ok || !c) return null;
+  let j: Record<string, unknown> = {};
+  try {
+    j = JSON.parse(outcome.content);
+  } catch {
+    /* summary is optional */
+  }
+  const value = (n: number, unit: string) => (unit === "USD" ? usdShort(n) : `${fmt(n)} ${unit}`);
+  let headline = "";
+  let facts: string[] = [];
+  if (c.kind === "chart") {
+    headline = c.headline;
+    facts = [...c.facts, ...(c.note ? [c.note] : [])];
+  } else if (c.kind === "trend") {
+    headline = typeof j.headline === "string" ? j.headline : c.title;
+    const display = j.display as { latest?: string } | undefined;
+    facts = [display?.latest ? `Latest: ${display.latest}.` : "", typeof j.direction === "string" ? `Direction: ${j.direction}.` : ""].filter(Boolean);
+  } else {
+    const [first, ...rest] = c.rows;
+    if (typeof j.headline === "string" && j.headline) {
+      headline = j.headline;
+      facts = Array.isArray(j.keyFacts) ? (j.keyFacts as string[]).slice(1) : [];
+    } else if (first) {
+      // MTBF ranking: lowest/highest first.
+      const order = /lowest/.test(c.title) ? "lowest" : "highest";
+      headline = `${first.label} has the ${order} ${c.metric} at ${value(first.value, c.unit)} (${c.filters.site || "all sites"}).`;
+      facts = rest.slice(0, 3).map((r) => `${r.label}: ${value(r.value, c.unit)}.`);
+    }
+  }
+  const answer = [`**${headline}**`, facts.map((f) => `- ${f}`).join("\n")].filter((x) => x && x !== "****").join("\n\n");
+  return {
+    answer,
+    sources: outcome.sources,
+    steps: [...(opts.steps ?? []), { tool, summary: outcome.summary, ok: true }].slice(-6),
+    warnings: [],
+    engine: "calculated",
+    designedBy: opts.designedBy,
+    notice: opts.notice,
+    report: opts.report ?? null,
+    charts: [c],
+  };
+}
+
+// Chart answer for questions the automatic look-up recognises (works with or without a model).
 function visualReply(data: Dataset, question: string, notice?: string): AssistantReply | null {
   const req = preRetrieve(question, data);
-  if (!req || !["trend_over_time", "rank_assets"].includes(req.name)) return null;
+  if (!req) return null;
   const out = runTool(req.name, req.args, data, defaultAssumptions);
-  if (!out.ok || !out.chart) return null;
-  const j = JSON.parse(out.content);
-  const c = out.chart;
-  const value = (n: number) => (c.unit === "USD" ? usdShort(n) : `${fmt(n)} ${c.unit}`);
-  let lines: string[];
-  if (c.kind === "trend") {
-    const change = j.changeFirstToLastThirdPct;
-    lines = [
-      `**${c.title}**`,
-      `Total ${value(j.total)} over ${j.periods} ${c.interval}s.${j.peak ? ` Peak: ${value(j.peak.value)} in ${j.peak.period}.` : ""}`,
-      change === null ? "" : `The average ${change >= 0 ? "rose" : "fell"} ${Math.abs(change)}% from the first third of the period to the last third.`,
-    ];
-  } else {
-    const [first, second] = c.rows;
-    lines = [
-      first ? `**${first.label} leads ${c.metric.toLowerCase()} with ${value(first.value)}${c.showShare ? ` (${first.share}% of ${value(c.total)})` : ""}.**` : `**${c.title}**`,
-      second ? `Next: ${second.label} at ${value(second.value)}${c.showShare ? ` (${second.share}%)` : ""}. Scope: ${c.filters.from}–${c.filters.to}.` : "",
-    ];
-  }
-  return { answer: lines.filter(Boolean).join("\n\n"), sources: out.sources, steps: [{ tool: req.name, summary: out.summary, ok: true }], warnings: [], engine: "guided", notice, charts: [c] };
+  return out.chart ? chartAnswer(out, req.name, { designedBy: "rules", notice }) : null;
+}
+
+// Questions that ask for reasons are answered in words (verified), even when a chart exists.
+const EXPLAIN = /\b(why|explain|reasons?|causes?|caused|how come|what happened|root cause)\b/i;
+
+// Removes every line containing an unverifiable figure or record ID.
+export function stripUnverified(answer: string, tokens: string[]) {
+  if (!tokens.length) return { text: answer, removed: 0 };
+  const lines = answer.split("\n");
+  const kept = lines.filter((line) => !tokens.some((t) => line.includes(t)));
+  return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), removed: lines.length - kept.length };
 }
 
 const PRESENTATION = /\b(table|tabulat\w*|summary|summari[sz]e|chart|graph|plot|visuali[sz]e|bullets?|break (?:it|that|this) down)\b/i;
@@ -409,6 +460,56 @@ const WRITE_INTENT =
   /^\s*(?:please\s+)?(?:(?:can|could|would) you\s+)?(?:please\s+)?(?:(?:delete|remove|edit|change|modify|update|approve|close|reset|rename|archive)\b|(?:create|add|record|register|log|insert)\b(?=.{0,40}\b(?:assets?|incidents?|rirs?|records?|actions?|assessments?|scenarios?|users?|accounts?|entr(?:y|ies)|failures?|events?)\b)(?!.{0,40}\b(?:table|summary|chart|graph|plot|report|list|overview|breakdown|comparison|trend|view)\b))/i;
 
 // When the question names exactly one asset, keep it in queries the model sends without an asset.
+// The AI's build_chart choice is corrected by anything the question states explicitly.
+// If the AI picks the ranking or trend tool but the question names a measure or grouping those
+// tools cannot show (e.g. "production loss by unit"), the call is switched to the chart builder.
+const RANK_TO_CHART: Record<string, string> = { actual_loss: "loss", potential_loss: "exposure", downtime: "days", maintenance: "maintenance", events: "events" };
+const TREND_TO_CHART: Record<string, string> = { failures: "events", actual_loss: "loss", downtime: "days", potential_loss: "exposure", records: "records", maintenance: "maintenance" };
+function guardChartChoice(call: ToolCall, question: string, d: Dataset): ToolCall {
+  const name = call.function.name;
+  if (!["build_chart", "rank_assets", "trend_over_time"].includes(name)) return call;
+  try {
+    const args = JSON.parse(call.function.arguments || "{}");
+    if (!args || typeof args !== "object") return call;
+    if (name === "build_chart") return { ...call, function: { ...call.function, arguments: JSON.stringify(reconcileWithQuestion(args, question, d)) } };
+    const rank = name === "rank_assets";
+    const base = rank
+      ? { type: (args.group_by || "asset") === "asset" ? "hbar" : "bar", metric: RANK_TO_CHART[args.metric] ?? "loss", dimension: args.group_by || "asset", filters: { site: args.site ?? "", category: args.category ?? "", from: args.from ?? 1990, to: args.to ?? 2026 } }
+      : { type: "line", metric: TREND_TO_CHART[args.metric] ?? "events", dimension: "year", filters: { asset: args.asset ?? "", site: args.site ?? "", category: args.category ?? "", mode: args.failure_mode ?? "", from: args.from ?? 1990, to: args.to ?? 2026 } };
+    const qMetric = metricIn(question);
+    const qDims = dimsIn(question);
+    const conflict = (qMetric && qMetric !== base.metric) || (qDims.length > 0 && !qDims.includes(base.dimension as never));
+    if (!conflict) return call;
+    return { ...call, function: { name: "build_chart", arguments: JSON.stringify(reconcileWithQuestion(base, question, d)) } };
+  } catch {
+    return call;
+  }
+}
+
+// Measures iAPM does not record. Asking for them gets a clear answer and what Relia can show instead.
+const UNRECORDED: [RegExp, string][] = [
+  [/\b(energy|power consumption|electricity|kwh|megawatt)\b/i, "energy consumption"],
+  [/\bfuel\b/i, "fuel use"],
+  [/\b(emissions?|co2|carbon footprint)\b/i, "emissions"],
+  [/\b(vibration|sensor readings?|temperature trends?|pressure trends?|process data|historian)\b/i, "live sensor or process readings"],
+  [/\b(spare parts?|inventory|stock levels?|warehouse)\b/i, "spare-parts inventory"],
+  [/\b(overtime|labou?r hours|technicians?|headcount|staffing|man-?hours)\b/i, "workforce data"],
+  [/\b(weather|rainfall|ambient)\b/i, "weather data"],
+  [/\b(purchase orders?|invoices?|procurement|supplier)\b/i, "procurement data"],
+];
+export function unavailableReply(question: string, name: string): AssistantReply | null {
+  const hit = UNRECORDED.find(([re]) => re.test(question));
+  if (!hit) return null;
+  return {
+    answer: `**iAPM doesn't record ${hit[1]}, so I can't show it.**\n\nI can chart or compare these measures from your records: failures, downtime, actual loss, potential loss, production loss, maintenance cost, repair hours and incident records, grouped by year, site, category, unit, asset, failure mode, MEDFI stage or F1/F2.\n\nFor example: "Bar chart of maintenance cost by asset for Machinery" or "Line chart of downtime per year by site".`,
+    sources: [],
+    steps: [],
+    warnings: [],
+    engine: "guided",
+    notice: `${name} only uses data recorded in iAPM, so nothing is estimated or invented.`,
+  };
+}
+
 function pinAsset(call: ToolCall, assetId: string | null, question: string): ToolCall {
   if (!assetId || !["query_reliability", "search_incidents"].includes(call.function.name)) return call;
   if (/\b(all assets|portfolio|compare|versus|vs\.?|across|other assets|fleet)\b/i.test(question)) return call;
@@ -470,6 +571,10 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
   const pre = (earlier && isReferentialFollowUp(question, data) ? preRetrieve(earlier, data) : null) ?? preRetrieve(question, data);
   if (pre) {
     const outcome = runTool(pre.name, pre.args, data, assumptions);
+    if (outcome.chart && !EXPLAIN.test(question)) {
+      const reply = chartAnswer(outcome, pre.name, { designedBy: "rules" });
+      if (reply) return reply;
+    }
     if (outcome.ok) {
       calls++;
       steps.push({ tool: pre.name, summary: `auto · ${outcome.summary}`, ok: true });
@@ -508,7 +613,7 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
         viaText = true;
       }
     }
-    toolCalls = toolCalls.map((c) => pinAsset(c, pinned, question));
+    toolCalls = toolCalls.map((c) => guardChartChoice(pinAsset(c, pinned, question), question, data));
     if (!toolCalls.length) {
       const obj = jsonMode ? parseJSONObject(content) : null;
       const draft = typeof obj?.answer === "string" ? obj.answer : content;
@@ -538,6 +643,10 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
         calls > MAX_TOOL_CALLS
           ? { ok: false, content: JSON.stringify({ error: "Tool-call limit reached. Answer with the results you have." }), sources: [], summary: "limit reached" }
           : runTool(call.function.name, call.function.arguments, data, assumptions);
+      if ("chart" in outcome && outcome.chart && !EXPLAIN.test(question)) {
+        const reply = chartAnswer(outcome as ToolOutcome, call.function.name, { designedBy: "model", steps });
+        if (reply) return { ...reply, model };
+      }
       steps.push({ tool: call.function.name, summary: outcome.summary, ok: outcome.ok });
       for (const s of outcome.sources) sources.set(s.id, s);
       if ("chart" in outcome && outcome.chart) charts.push(outcome.chart);
@@ -565,12 +674,19 @@ async function runLoop(input: RunInput, jsonMode: boolean): Promise<AssistantRep
   answer = applyHeadline(polishAnswer(answer.trim(), data), headline, leaderShare).slice(0, MAX_ANSWER);
   if (!answer) throw new AssistantError("The AI model returned an empty answer. Rephrase the question and retry.", 502);
 
+  // Only verified statements reach the user: lines with a figure that does not match the data
+  // retrieved for this answer (any figure, when no data was retrieved) or with an unknown record
+  // ID are removed.
   const checked = verifyCitations(answer, [...sources.values()], data);
-  const warnings = [...checked.warnings];
-  const unmatched = steps.length ? unmatchedFigures(answer, known) : [];
-  if (unmatched.length) warnings.push(`These figures do not match the data retrieved for this answer: ${unmatched.join(", ")}. Check them against the chart or the source records.`);
-  if (!steps.length && /\d/.test(answer)) warnings.push("No database tool was used for this answer. Treat any figures as general guidance, not plant data.");
-  return { answer, sources: checked.sources, steps, warnings, engine: "model", model, charts: charts.slice(-2) };
+  const unmatched = unmatchedFigures(answer, steps.length ? known : []);
+  const stripped = stripUnverified(answer, [...unmatched, ...checked.unknown]);
+  const warnings: string[] = [];
+  if (stripped.removed) warnings.push(`${stripped.removed} statement${stripped.removed === 1 ? " was" : "s were"} removed because ${stripped.removed === 1 ? "it" : "they"} could not be verified against the database.`);
+  if (!stripped.text.replace(/[*\s-]/g, "")) {
+    const fallback = guidedReply(data, question, assumptions, "The AI's answer could not be verified against the database, so this answer comes from the guided query engine.");
+    return { ...fallback, warnings };
+  }
+  return { answer: stripped.text, sources: verifyCitations(stripped.text, [...sources.values()], data).sources, steps, warnings, engine: "model", model, charts: charts.slice(-2) };
 }
 
 export async function runAssistant(input: RunInput): Promise<AssistantReply> {

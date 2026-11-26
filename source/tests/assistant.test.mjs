@@ -27,6 +27,7 @@ const sources = [];
 for (const f of await fs.readdir('lib')) if (f.endsWith('.ts') && !['runtime.ts', 'files.ts', 'd1-compat.ts'].includes(f)) sources.push(['lib/' + f, f.replace('.ts', ''), false]);
 for (const f of await fs.readdir('lib/assistant')) if (f.endsWith('.ts')) sources.push(['lib/assistant/' + f, 'assistant-' + f.replace('.ts', ''), true]);
 sources.push(['app/api/assistant/route.ts', 'assistant-route', false]);
+sources.push(['app/api/assistant/reports/route.ts', 'assistant-reports-route', false]);
 for (const [src, out, inAssistant] of sources) {
   let s = await fs.readFile(src, 'utf8');
   s = s
@@ -57,7 +58,10 @@ const ORIGIN = 'https://test.invalid';
 const post = (body, origin = ORIGIN) => route.POST(new Request(ORIGIN + '/api/assistant', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: typeof body === 'string' ? body : JSON.stringify(body) }));
 const json = async (r) => ({ status: r.status, body: await r.json() });
 const usageRows = () => rt.sql.prepare("SELECT COUNT(*) n FROM records WHERE kind='ai_usage'").get().n;
-const businessRows = () => rt.sql.prepare("SELECT COUNT(*) n FROM records WHERE kind NOT IN ('assistant_chat','ai_usage')").get().n;
+// Plant/business data. Relia's own rows (chat history, usage ledger, saved reports) are excluded.
+const businessRows = () => rt.sql.prepare("SELECT COUNT(*) n FROM records WHERE kind NOT IN ('assistant_chat','ai_usage','relia_report')").get().n;
+const reportsRoute = await load('assistant-reports-route.mjs');
+const reportsPost = (b) => reportsRoute.POST(new Request('https://test.invalid/api/assistant/reports', { method: 'POST', headers: { Origin: 'https://test.invalid', 'Content-Type': 'application/json' }, body: JSON.stringify(b) }));
 const clearModelEnv = () => { for (const k of ['AI_BASE_URL', 'AI_MODEL', 'AI_MODEL_LABEL', 'AI_API_KEY', 'AI_TOOL_MODE', 'AI_ASSISTANT_NAME', 'OPENAI_API_KEY', 'OPENAI_MODEL']) delete process.env[k]; };
 const attachModel = (extra = {}) => Object.assign(process.env, { AI_BASE_URL: 'https://model.test/v1/', AI_MODEL: 'relia-core-8b', AI_MODEL_LABEL: 'Relia Core', ...extra });
 // Mocked OpenAI-compatible server. `replies` are consumed in order.
@@ -123,15 +127,15 @@ await check('GET reports guided mode when no model is attached', async () => {
 });
 
 let guidedConversation;
-await check('Guided engine answers with cited records and no AI usage', async () => {
+await check('No model attached: chart answers are fully calculated, cited, and use no AI', async () => {
   globalThis.fetch = async () => { throw new Error('no network expected'); };
   const { status, body } = await json(await post({ question: 'Which are the top 5 bad actors by actual loss?' }));
   assert.equal(status, 200, JSON.stringify(body));
   const answer = body.conversation.messages[1];
-  assert.equal(answer.engine, 'guided');
+  assert.equal(answer.engine, 'calculated');
   assert.ok(answer.sources.length > 0);
   assert.match(answer.notice, /guided query engine/);
-  assert.match(answer.content, /^\*\*SC-E-101 leads actual loss with \$253\.6M \(8\.\d% of \$3\.1B\)\.\*\*/);
+  assert.ok(answer.content.startsWith(TOP_LOSS_HEADLINE), answer.content);
   assert.equal(answer.charts[0].kind, 'ranking');
   assert.equal(answer.charts[0].rows.length, 5);
   assert.equal(usageRows(), 0);
@@ -146,7 +150,7 @@ await check('Model tool loop: read-only tools, rejected write tool, verified cit
   const requests = mockModel([
     { content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_asset_profile', arguments: '{"asset":"sc-e-101"}' } }] },
     { content: null, tool_calls: [{ id: 'c2', type: 'function', function: { name: 'delete_asset', arguments: '{"asset":"AST-1"}' } }] },
-    { content: `SC-E-101 [AST-1] is the top loss asset. Latest event [${assetOne}]. See also [RIR-99999].` },
+    { content: `SC-E-101 [AST-1] is the top loss asset.\n- Latest event [${assetOne}].\n- See also [RIR-99999].` },
   ]);
   const { status, body } = await json(await post({ question: 'Tell me about SC-E-101' }));
   assert.equal(status, 200, JSON.stringify(body));
@@ -156,7 +160,7 @@ await check('Model tool loop: read-only tools, rejected write tool, verified cit
   assert.equal(requests.length, 3);
   assert.equal(requests[0].url, 'https://model.test/v1/chat/completions');
   assert.equal(requests[0].body.model, 'relia-core-8b');
-  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['rank_assets', 'trend_over_time', 'query_reliability', 'search_incidents', 'get_asset_profile']);
+  assert.deepEqual(requests[0].body.tools.map((t) => t.function.name), ['build_chart', 'rank_assets', 'trend_over_time', 'query_reliability', 'search_incidents', 'get_asset_profile']);
   assert.ok(!('Authorization' in requests[0].headers), 'no key configured, so no auth header');
   assert.match(requests[0].body.messages.find((x) => x.role === 'user').content, /SC-E-101 = AST-1/);
   assert.equal(requests[0].body.messages.at(-1).role, 'tool', 'data retrieved before the first model call');
@@ -168,8 +172,10 @@ await check('Model tool loop: read-only tools, rejected write tool, verified cit
   assert.match(m.steps[0].summary, /^auto · /);
   assert.ok(m.sources.some((s) => s.id === 'AST-1'));
   assert.ok(m.sources.some((s) => s.id === assetOne));
-  assert.match(m.warnings.join(' '), /RIR-99999/);
-  assert.ok(!m.warnings.join(' ').includes(assetOne));
+  // The line citing a record that does not exist is removed before the user sees it.
+  assert.ok(m.content.includes(assetOne));
+  assert.doesNotMatch(m.content, /RIR-99999/);
+  assert.match(m.warnings.join(' '), /1 statement was removed because it could not be verified/);
   assert.equal(usageRows() - before, 3);
   modelConversation = body.conversation;
 });
@@ -215,7 +221,7 @@ await check('OpenAI reasoning models: unsupported settings are adjusted and reme
   const system = requests[2].body.messages[0].content;
   assert.match(system, /Answer ONLY questions about this iAPM workspace/);
   assert.match(system, /under 90 words/);
-  await post({ question: 'Top bad actors please' });
+  await post({ question: 'Tell me about SC-E-101' });
   assert.equal(requests.length, 4, 'adjustments remembered: no retries on the next question');
   assert.ok('max_completion_tokens' in requests[3].body && !('temperature' in requests[3].body));
   clearModelEnv();
@@ -231,14 +237,13 @@ await check('Small-model fallback: tools rejected (400) → JSON protocol, <thin
     { content: '```json\n{"tool":"query_reliability","arguments":{"intent":"loss","limit":3}}\n```' },
     { content: '<think>reasoning here</think>{"answer":"The leading loss asset is SC-E-101 [AST-1]."}' },
   ]);
-  const { status, body } = await json(await post({ question: 'Top 3 bad actors?' }));
+  const { status, body } = await json(await post({ question: 'Tell me about SC-E-101' }));
   assert.equal(status, 200, JSON.stringify(body));
   const m = body.conversation.messages[1];
   assert.equal(m.engine, 'model');
-  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
-  assert.ok(m.content.endsWith('The leading loss asset is SC-E-101 [AST-1].'));
+  assert.equal(m.content, 'The leading loss asset is SC-E-101 [AST-1].');
   assert.equal(m.steps.length, 2);
-  assert.equal(m.steps[0].tool, 'rank_assets');
+  assert.equal(m.steps[0].tool, 'query_reliability');
   assert.ok(requests[1].body.tools === undefined && requests[2].body.tools === undefined);
   assert.match(requests[1].body.messages[0].content, /TOOLS\. To call a tool/);
   assert.match(requests[2].body.messages.at(-1).content, /TOOL RESULT \(query_reliability\)/);
@@ -257,19 +262,19 @@ await check('Tool call written as text (<tool_call>) is executed', async () => {
   assert.ok(m.sources.length > 0);
 });
 
-await check("Client case: potential-loss question is answered from the database before the model is asked", async () => {
-  const requests = mockModel([{ content: 'Highest potential exposure: see ranking [AST-1].' }]);
+await check("Client case: potential-loss question is answered entirely from the database, with no AI call", async () => {
+  const requests = mockModel([]);
   const { status, body } = await json(await post({ question: 'Identify the asset with the highest potential business loss' }));
   assert.equal(status, 200, JSON.stringify(body));
-  assert.equal(requests.length, 1);
-  const tool = requests[0].body.messages.find((x) => x.role === 'tool');
-  const result = JSON.parse(tool.content);
-  assert.match(result.metric, /Potential exposure/);
-  assert.equal(result.scope.site, 'all sites');
-  assert.ok(result.ranking.length > 0 && result.ranking[0].value > 0);
-  assert.ok(result.ranking.every((r, i, a) => i === 0 || a[i - 1].value >= r.value), 'sorted highest first');
-  assert.equal(body.conversation.messages[1].steps[0].tool, 'rank_assets');
-  assert.equal(body.conversation.messages[1].warnings.length, 0);
+  assert.equal(requests.length, 0);
+  const m = body.conversation.messages[1];
+  assert.equal(m.engine, 'calculated');
+  assert.equal(m.steps[0].tool, 'rank_assets');
+  assert.match(m.content, /^\*\*QW-E-209 leads potential exposure with \$21\.6M/);
+  const chart = m.charts[0];
+  assert.equal(chart.kind, 'ranking');
+  assert.ok(chart.rows.every((r, i, a) => i === 0 || a[i - 1].value >= r.value), 'sorted highest first');
+  assert.equal(m.warnings.length, 0);
 });
 
 await check("Client case: lazy reply ('provide the asset tag') triggers a forced database query", async () => {
@@ -281,12 +286,14 @@ await check("Client case: lazy reply ('provide the asset tag') triggers a forced
   const { status, body } = await json(await post({ question: 'Give me a quick read on this workspace please' }));
   assert.equal(status, 200, JSON.stringify(body));
   const m = body.conversation.messages[1];
-  assert.equal(requests.length, 3);
+  // The forced query produced a chart, so the answer is calculated and the third model call is skipped.
+  assert.equal(requests.length, 2);
   assert.equal(requests[0].body.tool_choice, 'auto');
   assert.equal(requests[1].body.tool_choice, 'required');
   assert.match(requests[1].body.messages.at(-1).content, /full read access/);
-  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
-  assert.ok(m.content.endsWith('The top loss driver across all assets is SC-E-101 [AST-1].'));
+  assert.equal(m.engine, 'calculated');
+  assert.equal(m.designedBy, 'model');
+  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE), m.content);
   assert.deepEqual(m.steps.map((s) => s.tool), ['rank_assets']);
   assert.equal(m.warnings.length, 0);
 });
@@ -303,18 +310,20 @@ await check('A named asset stays pinned when the model drops it from a query', a
   assert.match(requests[1].body.messages.at(-1).content, /SC-E-101/);
 });
 
-await check('Priority questions fetch the top loss drivers first; offers like "If you want, I can…" are retried', async () => {
+await check('Priority questions are answered from the top loss drivers; offers like "If you want, I can…" are retried', async () => {
+  const none = mockModel([]);
+  const focus = (await json(await post({ question: 'What should I focus on first?' }))).body.conversation.messages[1];
+  assert.equal(none.length, 0);
+  assert.equal(focus.steps[0].tool, 'rank_assets');
+  assert.ok(focus.content.startsWith(TOP_LOSS_HEADLINE), focus.content);
   const requests = mockModel([
     { content: 'Focus on SC-E-101 [AST-1]. If you want, I can fetch more details.' },
     { content: 'Focus on SC-E-101 [AST-1], the largest actual-loss asset.' },
   ]);
-  const { body } = await json(await post({ question: 'What should I focus on first?' }));
-  const m = body.conversation.messages[1];
-  assert.equal(m.steps[0].tool, 'rank_assets');
+  const m = (await json(await post({ question: 'Tell me about Safa Coast' }))).body.conversation.messages[1];
   assert.equal(requests.length, 2);
   assert.match(requests[1].body.messages.at(-1).content, /Do not ask the user/);
-  assert.ok(m.content.startsWith(TOP_LOSS_HEADLINE + '\n\n'), m.content); // calculated headline first
-  assert.ok(m.content.endsWith('Focus on SC-E-101 [AST-1], the largest actual-loss asset.'));
+  assert.equal(m.content, 'Focus on SC-E-101 [AST-1], the largest actual-loss asset.');
 });
 
 await check('Write requests get a fixed read-only reply naming the right screen, with no model call', async () => {
@@ -369,16 +378,14 @@ await check('Trend tool: same numbers as the Executive overview chart engine; mo
   assert.equal(runTool('trend_over_time', { metric: 'failures', from: 2030, to: 2040 }, data, defaultAssumptions).ok, false);
 });
 
-await check('"Plot the failure trend for SC-E-101 since 2010": data fetched first, chart saved with the answer', async () => {
-  const requests = mockModel([{ content: 'SC-E-101 [AST-1] failures stayed steady since 2010, peaking recently.' }]);
+await check('"Plot the failure trend for SC-E-101 since 2010": calculated chart and text, no AI call, saved with the answer', async () => {
+  const requests = mockModel([]);
   const { status, body } = await json(await post({ question: 'Plot the failure trend for SC-E-101 since 2010' }));
   assert.equal(status, 200, JSON.stringify(body));
-  assert.equal(requests.length, 1);
-  assert.ok(requests[0].body.tools.some((t) => t.function.name === 'trend_over_time'));
-  const tool = JSON.parse(requests[0].body.messages.find((x) => x.role === 'tool').content);
-  assert.equal(tool.scope.asset, 'SC-E-101');
-  assert.equal(tool.scope.from, 2010);
+  assert.equal(requests.length, 0);
   const m = body.conversation.messages[1];
+  assert.equal(m.engine, 'calculated');
+  assert.match(m.content, /^\*\*Downtime events for SC-E-101 .* over 2010–2026/);
   assert.equal(m.steps[0].tool, 'trend_over_time');
   assert.equal(m.charts.length, 1);
   assert.equal(m.charts[0].points[0].period, '2010');
@@ -392,13 +399,19 @@ await check('Figure check: a garbled total (real case: 97,395,033,600 for 973,95
   assert.deepEqual(unmatchedFigures('Total actual loss: 97,395,033,600 USD.', known), ['97,395,033,600']);
   assert.deepEqual(unmatchedFigures('Total 973,950,336 USD (≈ $974M); peak 35,596,618 in 1990; MTBF 3,846.3 h; $21.6M exposure. SC-E-101 [RIR-04609] 2010–2026, 95 events.', known), []);
   assert.deepEqual(unmatchedFigures('About $3.2B lost.', known), ['3.2B']);
-  mockModel([{ content: 'Safa Coast actual loss totals 97,395,033,600 USD since 1990.' }]);
-  const { body } = await json(await post({ question: 'Show actual loss per year at Safa Coast' }));
+  // In a written answer, the line with the garbled figure is removed; the verified line stays.
+  mockModel([{ content: 'Safa Coast is a major contributor to loss [AST-1].\n- Actual loss totals 97,395,033,600 USD since 1990.' }]);
+  const { body } = await json(await post({ question: 'Tell me about Safa Coast' }));
   const m = body.conversation.messages[1];
-  // Displayed (and named in the warning) as the tidied $97.4B.
-  assert.match(m.content, /\$97\.4B/);
-  assert.match(m.warnings.join(' '), /do not match the data retrieved.*97\.4B/);
-  assert.equal(m.charts.length, 1, 'the chart itself is still correct and shown');
+  assert.equal(m.content, 'Safa Coast is a major contributor to loss [AST-1].');
+  assert.doesNotMatch(m.content, /97/);
+  assert.match(m.warnings.join(' '), /1 statement was removed because it could not be verified/);
+  // If nothing verifiable is left, the user gets the calculated guided answer instead.
+  mockModel([{ content: 'Total loss was 12,345,678,901 USD.' }]);
+  const all = (await json(await post({ question: 'Tell me about Safa Coast' }))).body.conversation.messages[1];
+  assert.equal(all.engine, 'guided');
+  assert.doesNotMatch(all.content, /12,345|12\.3B/);
+  assert.match(all.notice, /could not be verified/);
 });
 
 await check('"Create a tabulated summary" is answered (not refused); creating records is still refused', async () => {
@@ -419,35 +432,41 @@ await check('"Create a tabulated summary" is answered (not refused); creating re
   assert.equal(requests.length, before, 'no model call for record changes');
 });
 
-await check('Site comparison: bar chart + table by site, totals equal Bad actors aggregate, no incident IDs given to the model', async () => {
+await check('Site comparison (comparative analysis): totals equal the Bad actors aggregate; calculated, no AI call', async () => {
   const { aggregate } = await load('domain.mjs');
-  const requests = mockModel([{ content: '**Safa Coast drives a third of actual loss.**' }]);
+  const requests = mockModel([]);
   const { body } = await json(await post({ question: 'Compare actual loss across sites from 2016 to 2025.' }));
   const m = body.conversation.messages[1];
+  assert.equal(requests.length, 0);
+  assert.equal(m.engine, 'calculated');
   const chart = m.charts[0];
-  assert.equal(chart.kind, 'ranking');
-  assert.equal(chart.groupBy, 'site');
-  assert.equal(chart.rows.length, 4);
+  assert.equal(chart.kind, 'chart');
+  assert.equal(chart.type, 'compare');
+  assert.equal(chart.categories.length, 4);
   const data = JSON.parse(baseline);
   const rows = data.incidents.filter((e) => +e.date.slice(0, 4) >= 2016 && +e.date.slice(0, 4) <= 2025);
   const perSite = {};
   for (const r of aggregate(data, rows)) perSite[r.site] = (perSite[r.site] || 0) + r.loss;
-  for (const row of chart.rows) assert.equal(row.value, Math.round(perSite[row.label]), row.label);
-  assert.ok(chart.rows.every((r, i, a) => i === 0 || a[i - 1].value >= r.value));
-  assert.ok(Math.abs(chart.rows.reduce((s, r) => s + r.share, 0) - 100) < 0.5);
-  const tool = requests[0].body.messages.find((x) => x.role === 'tool').content;
-  assert.doesNotMatch(tool, /RIR-/, 'no incident IDs for portfolio totals');
+  chart.categories.forEach((site, i) => assert.equal(chart.series[0].values[i], Math.round(perSite[site]), site));
+  assert.match(m.content, /^\*\*Safa Coast leads actual business loss among the 4 compared with \$271\.1M, about a third \(32\.6%\)/);
+  assert.equal(chart.table.columns[0], 'Measure');
+  assert.doesNotMatch(m.content, /RIR-/, 'no incident IDs for portfolio totals');
 });
 
 await check('Follow-up "Create a tabulated summary" re-uses the previous question\'s data (site comparison), not a generic overview', async () => {
-  mockModel([{ content: '**Safa Coast drives about a third of actual loss.**' }]);
+  const requests = mockModel([]);
   const first = (await json(await post({ question: 'Compare actual loss across sites from 2016 to 2025.' }))).body.conversation;
-  const requests = mockModel([{ content: '| Site | Actual loss |\n|---|---|\n| Safa Coast | $271.1M |' }]);
   const second = (await json(await post({ question: 'Create a tabulated summary', conversationId: first.id }))).body.conversation.messages.at(-1);
-  assert.equal(second.steps[0].tool, 'rank_assets');
-  assert.match(second.steps[0].summary, /by site · 2016–2025/);
-  assert.equal(second.charts[0].groupBy, 'site');
-  assert.match(requests[0].body.messages[0].content, /write a real markdown table/);
+  assert.equal(requests.length, 0);
+  assert.equal(second.charts[0].type, 'table');
+  assert.equal(second.charts[0].spec.dimension, 'site');
+  assert.equal(second.charts[0].spec.filters.from, 2016);
+  assert.equal(second.charts[0].table.rows.length, 4);
+  // "make it a donut" changes only the chart type.
+  const third = (await json(await post({ question: 'make it a donut', conversationId: first.id }))).body.conversation.messages.at(-1);
+  assert.equal(third.charts[0].type, 'donut');
+  assert.equal(third.charts[0].spec.metric, 'loss');
+  assert.equal(third.charts[0].spec.filters.to, 2025);
   const { isReferentialFollowUp } = await load('assistant-engine.mjs');
   const data = JSON.parse(baseline);
   for (const q of ['Create a tabulated summary', 'chart it', 'Summarize that as bullets', 'Can you put this in a table?']) assert.ok(isReferentialFollowUp(q, data), q);
@@ -504,20 +523,21 @@ await check('Executive number formatting: cents and long USD figures become $271
   assert.equal(applyHeadline('- 32.6% of total, a clear majority among top contributors.', '', 32.6), '- 32.6% of total, the largest share among top contributors.');
 });
 
-await check('Trend questions still get a chart when the model is down', async () => {
+await check('Trend questions are answered from data even when the model is down (it is never called)', async () => {
   globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
   const { body } = await json(await post({ question: 'Show downtime per year at Wadi North for the last 10 years' }));
   const m = body.conversation.messages[1];
-  assert.equal(m.engine, 'guided');
+  assert.equal(m.engine, 'calculated');
+  assert.equal(m.notice, undefined);
   assert.equal(m.charts.length, 1);
   assert.equal(m.charts[0].points.length, 10);
   assert.equal(m.charts[0].filters.site, 'Wadi North');
-  assert.match(m.content, /Total .* asset-days over 10 years/);
+  assert.match(m.content, /^\*\*Virtual downtime at Wadi North .* over 2017–2026/);
 });
 
 await check('Model unreachable → guided answer with a visible notice', async () => {
   globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
-  const { status, body } = await json(await post({ question: 'Compare actual loss by site' }));
+  const { status, body } = await json(await post({ question: 'Tell me about SC-E-101' }));
   assert.equal(status, 200);
   const m = body.conversation.messages[1];
   assert.equal(m.engine, 'guided');
@@ -534,6 +554,165 @@ await check('Tools run on frozen data: calculations work, mutation is impossible
   assert.equal(bad.ok, false);
   assert.match(bad.content, /Unknown site/);
   assert.equal(runTool('search_incidents', '{broken', data, defaultAssumptions).ok, false);
+});
+
+await check('Client chart list: pie, donut, bar, line, stacked, clustered, bubble, comparison: all calculated, no AI call', async () => {
+  const requests = mockModel([]);
+  const cases = [
+    ['Show a pie chart of actual loss by site', 'pie', 'loss', 'site'],
+    ['Donut chart of downtime by failure mode at Wadi North since 2015', 'donut', 'days', 'mode'],
+    ['Bar graph of downtime by category', 'bar', 'days', 'category'],
+    ['Line chart of loss per year by site', 'line', 'loss', 'year'],
+    ['Stacked bar of failures per year by site', 'stacked', 'events', 'year'],
+    ['Clustered bar of actual loss by site and category', 'clustered', 'loss', 'site'],
+    ['Bubble chart of downtime vs loss by site', 'bubble', 'loss', 'site'],
+    ['Compare Safa Coast vs Wadi North', 'compare', 'loss', 'site'],
+    ['Compare 2010-2015 vs 2020-2025', 'compare', 'loss', 'year'],
+  ];
+  for (const [q, type, metric, dim] of cases) {
+    const m = (await json(await post({ question: q }))).body.conversation.messages[1];
+    const c = m.charts[0];
+    assert.equal(m.engine, 'calculated', q);
+    assert.equal(c.kind, 'chart', q);
+    assert.equal(c.type, type, q);
+    assert.equal(c.spec.metric, metric, q);
+    assert.equal(c.spec.dimension, dim, q);
+    assert.ok(c.table.rows.length > 0, q);
+    assert.ok(m.content.startsWith('**') && !m.content.includes('undefined') && !m.content.includes('NaN'), `${q}: ${m.content}`);
+  }
+  assert.equal(requests.length, 0);
+});
+
+await check('Chart numbers match the Executive overview engine exactly (pie shares, stacked totals, bubble axes, filters)', async () => {
+  const { factsFor, groupFacts } = await load('visual-analytics.mjs');
+  const { buildChart } = await load('assistant-charts.mjs');
+  const data = deepFreeze(JSON.parse(baseline));
+  const facts = factsFor(data, data.incidents);
+  const pie = buildChart(data, { type: 'pie', metric: 'loss', dimension: 'site' });
+  const bySite = Object.fromEntries(groupFacts(facts, 'site').map((g) => [g.name, Math.round(g.loss)]));
+  pie.categories.forEach((s, i) => assert.equal(pie.series[0].values[i], bySite[s], s));
+  const stacked = buildChart(data, { type: 'stacked', metric: 'events', dimension: 'year', series: 'site' });
+  const byYear = Object.fromEntries(groupFacts(facts, 'year').map((g) => [g.name, g.events]));
+  stacked.categories.forEach((y, i) => assert.equal(stacked.series.reduce((s, x) => s + x.values[i], 0), byYear[y] || 0, y));
+  const bubble = buildChart(data, { type: 'bubble', metric: 'loss', dimension: 'site', x: 'days', y: 'loss', size: 'exposure' });
+  const bySiteG = Object.fromEntries(groupFacts(facts, 'site').map((g) => [g.name, g]));
+  for (const p of bubble.points) {
+    assert.equal(p.y, Math.round(bySiteG[p.label].loss));
+    assert.equal(p.x, Math.round(bySiteG[p.label].days * 10) / 10);
+  }
+  const wn = buildChart(data, { type: 'donut', metric: 'days', dimension: 'mode', filters: { site: 'wadi north', from: 2015 } });
+  const wnFacts = factsFor(data, data.incidents.filter((e) => data.assets.find((a) => a.id === e.assetId).site === 'Wadi North' && +e.date.slice(0, 4) >= 2015));
+  const wnTotal = wnFacts.reduce((s, f) => s + f.days, 0);
+  assert.ok(Math.abs(wn.series[0].values.reduce((s, v) => s + v, 0) - wnTotal) < 0.5);
+  assert.equal(wn.spec.filters.site, 'Wadi North', 'names normalised');
+  assert.throws(() => buildChart(data, { type: 'pie', metric: 'loss', dimension: 'site', filters: { site: 'Atlantis' } }), /Unknown site/);
+});
+
+await check('Requests the parser does not recognise: the AI chooses build_chart, the answer is calculated (one model call)', async () => {
+  const requests = mockModel([{ content: null, tool_calls: [{ id: 'b1', type: 'function', function: { name: 'build_chart', arguments: JSON.stringify({ type: 'hbar', metric: 'repair', dimension: 'mode', series: '', filters: { site: 'Mizan Bay' } }) } }] }]);
+  const m = (await json(await post({ question: 'Visualise the repair effort across failure modes at Mizan Bay' }))).body.conversation.messages[1];
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.tools[0].function.name, 'build_chart');
+  assert.equal(m.engine, 'calculated');
+  assert.equal(m.designedBy, 'model');
+  assert.equal(m.charts[0].type, 'hbar');
+  assert.equal(m.charts[0].spec.filters.site, 'Mizan Bay');
+  assert.match(m.content, /^\*\*.+ leads repair effort with .+ hours/);
+  // Invalid choices are rejected, never charted.
+  const bad = runTool('build_chart', { type: 'pie', metric: 'loss', dimension: 'site', filters: { site: 'Atlantis' } }, deepFreeze(JSON.parse(baseline)), defaultAssumptions);
+  assert.equal(bad.ok, false);
+  assert.match(bad.content, /Unknown site/);
+});
+
+await check('Guard on the AI\'s chart choice: the question\'s own words win (real case: "repair effort" charted as maintenance cost by asset)', async () => {
+  const requests = mockModel([{ content: null, tool_calls: [{ id: 'g2', type: 'function', function: { name: 'build_chart', arguments: JSON.stringify({ type: 'clustered', metric: 'maintenance', dimension: 'mode', series: 'asset', filters: { site: 'Mizan Bay' } }) } }] }]);
+  // (The original wording is now understood without the AI; this phrasing still goes to the AI.)
+  const m = (await json(await post({ question: 'Visualise repair effort for each failure mode at Mizan Bay' }))).body.conversation.messages[1];
+  assert.equal(requests.length, 1);
+  const c = m.charts[0];
+  assert.equal(c.spec.metric, 'repair', 'measure named in the question');
+  assert.equal(c.spec.dimension, 'mode');
+  assert.equal(c.spec.series, null, 'no second grouping the user did not ask for');
+  assert.equal(c.type, 'bar');
+  assert.equal(c.spec.filters.site, 'Mizan Bay');
+  const { reconcileWithQuestion } = await load('assistant-charts.mjs');
+  const data = JSON.parse(baseline);
+  const r = reconcileWithQuestion({ type: 'bar', metric: 'loss', dimension: 'site', filters: {} }, 'Donut of downtime by category for SC-E-101 since 2015', data);
+  assert.deepEqual([r.type, r.metric, r.dimension, r.filters.asset, r.filters.from, r.filters.to], ['donut', 'days', 'category', 'SC-E-101', 2015, 2026]);
+});
+
+await check('Live-test gaps fixed: "break down by", ranking-tool misuse corrected, unrecorded data explained, clean headline grammar', async () => {
+  const none = mockModel([]);
+  const breakdown = (await json(await post({ question: 'How does production loss break down by unit?' }))).body.conversation.messages[1];
+  assert.equal(none.length, 0, 'understood without the AI');
+  assert.equal(breakdown.charts[0].type, 'bar');
+  assert.equal(breakdown.charts[0].spec.metric, 'production');
+  assert.equal(breakdown.charts[0].spec.dimension, 'unit');
+  // The AI picks the ranking tool (actual loss) for a production question → switched to the builder.
+  const requests = mockModel([{ content: null, tool_calls: [{ id: 'r9', type: 'function', function: { name: 'rank_assets', arguments: '{"metric":"actual_loss"}' } }] }]);
+  const fixed = (await json(await post({ question: 'Which units lose the most production?' }))).body.conversation.messages[1];
+  assert.equal(requests.length, 1);
+  assert.equal(fixed.steps.at(-1).tool, 'build_chart');
+  assert.equal(fixed.charts[0].spec.metric, 'production');
+  // Data iAPM does not record: a clear answer, never the off-topic reply, never a guess.
+  const energy = (await json(await post({ question: 'Show me energy consumption per pump' }))).body.conversation.messages[1];
+  assert.match(energy.content, /^\*\*iAPM doesn't record energy consumption/);
+  assert.doesNotMatch(energy.content, /can only help with questions/);
+  assert.equal(energy.charts, undefined);
+  const area = (await json(await post({ question: 'Give me an area chart of potential exposure per year for Instrumentation' }))).body.conversation.messages[1];
+  assert.match(area.content, /^\*\*Potential business exposure in Instrumentation totalled \$344\.7M over 1990–2026 and (remained broadly flat|rose \d+%|fell \d+%), peaking at \$16\.5M in 2011\.\*\*/);
+});
+
+let savedId = '';
+await check('Saved reports: save a chart; asking again shows it directly (no prompt); by name; by click; duplicates reuse', async () => {
+  const requests = mockModel([]);
+  const first = (await json(await post({ question: 'Stacked bar of failures per year by site' }))).body.conversation.messages[1];
+  const save = await json(await reportsPost({ action: 'save', name: 'Failures by site per year', spec: first.charts[0].spec, question: 'Stacked bar of failures per year by site' }));
+  assert.equal(save.status, 200, JSON.stringify(save.body));
+  savedId = save.body.report.id;
+  assert.equal(save.body.existing, false);
+  // Same chart asked differently → the saved report is shown straight away.
+  const again = (await json(await post({ question: 'stacked chart of downtime events per year by site' }))).body.conversation.messages[1];
+  assert.equal(again.report.id, savedId);
+  assert.equal(again.designedBy, 'saved');
+  assert.equal(again.charts[0].type, 'stacked');
+  // By name.
+  const byName = (await json(await post({ question: 'Show my failures by site per year report' }))).body.conversation.messages[1];
+  assert.equal(byName.report.id, savedId);
+  // By click (reportId), and listed for the sidebar.
+  const click = (await json(await post({ reportId: savedId }))).body.conversation;
+  assert.equal(click.messages[0].content, 'Failures by site per year');
+  assert.equal(click.messages[1].report.name, 'Failures by site per year');
+  const listed = (await json(await route.GET())).body.reports;
+  assert.deepEqual(listed.map((r) => r.name), ['Failures by site per year']);
+  // Saving the same recipe again reuses the existing report.
+  const dup = await json(await reportsPost({ action: 'save', name: 'Copy', spec: first.charts[0].spec }));
+  assert.equal(dup.body.existing, true);
+  assert.equal(dup.body.report.id, savedId);
+  assert.equal(requests.length, 0, 'saved reports never call the AI');
+});
+
+await check('Saved reports: rename, delete, validation, and privacy between accounts', async () => {
+  const renamed = await json(await reportsPost({ action: 'rename', id: savedId, name: 'Yearly failures by site' }));
+  assert.equal(renamed.body.report.name, 'Yearly failures by site');
+  assert.equal((await reportsPost({ action: 'save', name: 'Bad', spec: { type: 'pie', metric: 'loss', dimension: 'site', filters: { site: 'Atlantis' } } })).status, 400);
+  assert.equal((await reportsPost({ action: 'save', name: '   ', spec: { type: 'pie' } })).status, 400);
+  assert.equal((await reportsRoute.POST(new Request('https://test.invalid/api/assistant/reports', { method: 'POST', headers: { Origin: 'https://evil.invalid' }, body: '{}' }))).status, 403);
+  rt.sql.prepare('INSERT OR IGNORE INTO accounts VALUES(?,?,?,?)').run('stranger', 'stranger@example.invalid', 'h', 's');
+  rt.sql.prepare('INSERT INTO sessions VALUES(?,?,?)').run(await digest('stranger-token'), 'stranger', Date.now() + 1e7);
+  rt.context('stranger-token');
+  assert.equal((await json(await reportsRoute.GET())).body.reports.length, 0);
+  assert.equal((await post({ reportId: savedId })).status, 404);
+  assert.equal((await reportsPost({ action: 'delete', id: savedId })).status, 404);
+  rt.context('owner-token');
+  assert.equal((await reportsPost({ action: 'delete', id: savedId })).status, 200);
+  assert.equal((await json(await reportsRoute.GET())).body.reports.length, 0);
+});
+
+await check('Verified text: stripUnverified removes only the lines that fail verification', async () => {
+  const { stripUnverified } = await load('assistant-engine.mjs');
+  assert.deepEqual(stripUnverified('**Headline**\n- good line\n- bad $97.4B line\n- also good', ['97.4B']), { text: '**Headline**\n- good line\n- also good', removed: 1 });
+  assert.deepEqual(stripUnverified('nothing to remove', []), { text: 'nothing to remove', removed: 0 });
 });
 
 await check('Read-only guarantee: no business records written by any assistant request', async () => {
